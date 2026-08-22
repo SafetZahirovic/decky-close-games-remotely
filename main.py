@@ -182,26 +182,69 @@ def get_local_mac() -> str:
     return ""
 
 
+def _get_subnet_broadcast(target_ip: str) -> str | None:
+    """Compute the subnet broadcast address for a target IP by inspecting network interfaces."""
+    import ipaddress
+    try:
+        target = ipaddress.IPv4Address(target_ip)
+        # Read network interfaces from /proc/net/if_inet6 is IPv6 only,
+        # use ip command for IPv4 interface info
+        import subprocess
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.split("\n"):
+            line = line.strip()
+            if line.startswith("inet "):
+                # Format: "inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0"
+                parts = line.split()
+                try:
+                    network = ipaddress.IPv4Network(parts[1], strict=False)
+                    if target in network:
+                        return str(network.broadcast_address)
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        decky.logger.warning(f"Could not compute subnet broadcast: {e}")
+    return None
+
+
 def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
-    """Send Wake-on-LAN magic packets to multiple destinations (like MoonDeck)."""
+    """Send Wake-on-LAN magic packets to 3 targets (like LG_Buddy):
+    1. Subnet broadcast (e.g., 192.168.1.255) — most reliable
+    2. Direct to host IP — works if switch remembers MAC
+    3. Global broadcast (255.255.255.255) — fallback
+    """
     mac_bytes = bytes.fromhex(mac_address.replace(":", "").replace("-", ""))
     magic = b"\xff" * 6 + mac_bytes * 16
 
+    seen = set()
     targets = []
 
-    # Always send to global broadcast
-    targets.append(("255.255.255.255", socket.AF_INET))
+    def add_target(addr: str, family: int = socket.AF_INET):
+        key = (addr, family)
+        if key not in seen:
+            seen.add(key)
+            targets.append(key)
 
-    # Also send directly to the host IP (works even when device is off
-    # because the switch/router may still have the MAC in its table)
+    # 1. Subnet broadcast (most reliable — routers forward these within the subnet)
+    if host_ip:
+        subnet_bcast = _get_subnet_broadcast(host_ip)
+        if subnet_bcast:
+            add_target(subnet_bcast)
+
+    # 2. Direct to host IP
     if host_ip:
         try:
             for info in socket.getaddrinfo(host_ip, port, family=socket.AF_UNSPEC):
                 family, _, _, _, sockaddr = info
                 if family in (socket.AF_INET, socket.AF_INET6):
-                    targets.append((sockaddr[0], family))
+                    add_target(sockaddr[0], family)
         except socket.gaierror:
-            targets.append((host_ip, socket.AF_INET))
+            add_target(host_ip)
+
+    # 3. Global broadcast (fallback)
+    add_target("255.255.255.255")
 
     for addr, family in targets:
         try:
@@ -211,7 +254,7 @@ def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
                 sock.send(magic)
                 decky.logger.info(f"WOL packet sent to {addr}:{port}")
         except OSError as err:
-            if err.errno in (101, 65):  # ENETUNREACH (Linux / macOS)
+            if err.errno in (101, 65, 113):  # ENETUNREACH / EHOSTUNREACH
                 decky.logger.warning(f"WOL to {addr} failed: {err}")
             else:
                 raise
@@ -501,14 +544,19 @@ def _ws_make_recv(reader):
 async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> dict:
     """Turn off an LG WebOS TV using the SSAP protocol over WebSocket.
     Tries port 3000 (plain) and 3001 (SSL). Optionally wakes the TV first via WOL."""
-    # If TV is unreachable, try waking it first (some LG TVs support WOL in standby)
+    # Try connecting first
     reader, writer, errors = await _ws_connect(tv_ip)
 
+    # If TV is unreachable and we have a MAC, try WOL with retries (like LG_Buddy)
     if not reader and tv_mac:
         decky.logger.info(f"TV unreachable, trying WOL to {tv_mac}...")
-        send_wol(tv_mac, host_ip=tv_ip)
-        await asyncio.sleep(5)
-        reader, writer, errors = await _ws_connect(tv_ip)
+        for attempt in range(4):
+            send_wol(tv_mac, host_ip=tv_ip)
+            delay = min((attempt + 1) * 3, 10)  # 3s, 6s, 9s, 10s
+            await asyncio.sleep(delay)
+            reader, writer, errors = await _ws_connect(tv_ip)
+            if reader:
+                break
 
     if not reader:
         return {"status": "error", "message": f"Cannot connect to TV at {tv_ip}. {errors}"}
