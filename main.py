@@ -456,20 +456,45 @@ def _ws_make_send(writer):
 
 
 def _ws_make_recv(reader):
-    """Create a WebSocket receive function."""
+    """Create a WebSocket receive function that handles masked/binary/ping frames."""
     async def ws_recv() -> str:
-        header = await asyncio.wait_for(reader.read(2), timeout=10)
-        if len(header) < 2:
-            return ""
-        length = header[1] & 0x7F
-        if length == 126:
-            ext = await reader.read(2)
-            length = struct.unpack(">H", ext)[0]
-        elif length == 127:
-            ext = await reader.read(8)
-            length = struct.unpack(">Q", ext)[0]
-        data = await asyncio.wait_for(reader.read(length), timeout=10)
-        return data.decode()
+        while True:
+            header = await asyncio.wait_for(reader.readexactly(2), timeout=10)
+            opcode = header[0] & 0x0F
+            masked = bool(header[1] & 0x80)
+            length = header[1] & 0x7F
+
+            if length == 126:
+                ext = await reader.readexactly(2)
+                length = struct.unpack(">H", ext)[0]
+            elif length == 127:
+                ext = await reader.readexactly(8)
+                length = struct.unpack(">Q", ext)[0]
+
+            # Read mask key if present
+            mask_key = None
+            if masked:
+                mask_key = await reader.readexactly(4)
+
+            data = await asyncio.wait_for(reader.readexactly(length), timeout=10) if length > 0 else b""
+
+            # Unmask if needed
+            if mask_key and data:
+                data = bytes(b ^ mask_key[i % 4] for i, b in enumerate(data))
+
+            # Handle different opcodes
+            if opcode == 0x01:  # Text frame
+                return data.decode("utf-8", errors="replace")
+            elif opcode == 0x02:  # Binary frame — try to decode as text
+                return data.decode("utf-8", errors="replace")
+            elif opcode == 0x08:  # Close
+                return ""
+            elif opcode == 0x09:  # Ping — ignore and read next frame
+                continue
+            elif opcode == 0x0A:  # Pong — ignore and read next frame
+                continue
+            else:
+                return data.decode("utf-8", errors="replace")
     return ws_recv
 
 
