@@ -23,7 +23,7 @@ const addDevice = callable<[name: string, ip: string, mac: string], boolean>("ad
 const removeDevice = callable<[ip: string], boolean>("remove_device");
 const setTvIp = callable<[tvIp: string], boolean>("set_tv_ip");
 const pingDevice = callable<[ip: string], PingResult>("ping_device");
-const wakeDevice = callable<[mac: string], StatusResult>("wake_device");
+const wakeDevice = callable<[mac: string, ip: string], StatusResult>("wake_device");
 const getRemoteStatus = callable<[ip: string], RemoteStatus>("get_remote_status");
 const closeRemoteGames = callable<[ip: string], CloseResult>("close_remote_games");
 const nukeDevice = callable<
@@ -184,7 +184,7 @@ function DeviceCard({
     setProgress("Closing games...");
     if (status === "offline") {
       setProgress("Waking device...");
-      await wakeDevice(device.mac);
+      await wakeDevice(device.mac, device.ip);
       // Wait for device
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 2000));

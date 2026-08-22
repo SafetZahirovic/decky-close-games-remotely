@@ -113,13 +113,39 @@ class MiniHTTPServer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def send_wol(mac_address: str, broadcast: str = "255.255.255.255"):
-    """Send a Wake-on-LAN magic packet."""
+def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
+    """Send Wake-on-LAN magic packets to multiple destinations (like MoonDeck)."""
     mac_bytes = bytes.fromhex(mac_address.replace(":", "").replace("-", ""))
     magic = b"\xff" * 6 + mac_bytes * 16
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(magic, (broadcast, 9))
+
+    targets = []
+
+    # Always send to global broadcast
+    targets.append(("255.255.255.255", socket.AF_INET))
+
+    # Also send directly to the host IP (works even when device is off
+    # because the switch/router may still have the MAC in its table)
+    if host_ip:
+        try:
+            for info in socket.getaddrinfo(host_ip, port, family=socket.AF_UNSPEC):
+                family, _, _, _, sockaddr = info
+                if family in (socket.AF_INET, socket.AF_INET6):
+                    targets.append((sockaddr[0], family))
+        except socket.gaierror:
+            targets.append((host_ip, socket.AF_INET))
+
+    for addr, family in targets:
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.connect((addr, port))
+                sock.send(magic)
+                decky.logger.info(f"WOL packet sent to {addr}:{port}")
+        except OSError as err:
+            if err.errno in (101, 65):  # ENETUNREACH (Linux / macOS)
+                decky.logger.warning(f"WOL to {addr} failed: {err}")
+            else:
+                raise
 
 
 def get_running_games() -> list[dict]:
@@ -429,10 +455,10 @@ class Plugin:
 
     # ---- Remote commands --------------------------------------------------
 
-    async def wake_device(self, mac: str) -> dict:
+    async def wake_device(self, mac: str, ip: str = "") -> dict:
         """Send WOL magic packet to wake a device."""
         try:
-            send_wol(mac)
+            send_wol(mac, host_ip=ip)
             return {"status": "ok"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -522,13 +548,14 @@ class Plugin:
         """
         try:
             await decky.emit("nuke_progress", "Sending wake-on-LAN...")
-            send_wol(mac)
+            send_wol(mac, host_ip=ip)
 
-            # Wait for the remote plugin to come online
+            # Wait for the remote plugin to come online, resending WOL every 10s
             await decky.emit("nuke_progress", "Waiting for device to boot...")
             loop = asyncio.get_event_loop()
             online = False
-            for attempt in range(60):  # up to 60 seconds
+            since_last_wol = 0
+            for attempt in range(60):  # up to 120 seconds (60 * 2s sleep)
                 result = await loop.run_in_executor(
                     None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
                 )
@@ -536,6 +563,11 @@ class Plugin:
                     online = True
                     break
                 await asyncio.sleep(2)
+                since_last_wol += 2
+                if since_last_wol >= 10:
+                    send_wol(mac, host_ip=ip)
+                    since_last_wol = 0
+                    decky.logger.info("Resending WOL packet...")
 
             if not online:
                 await decky.emit("nuke_progress", "ERROR: Device did not come online")
