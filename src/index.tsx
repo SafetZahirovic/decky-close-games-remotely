@@ -19,7 +19,7 @@ import { FaPowerOff, FaPlus, FaTrash, FaTv, FaDesktop, FaSyncAlt } from "react-i
 
 // Backend callables
 const getSettings = callable<[], Settings>("get_settings");
-const addDevice = callable<[name: string, ip: string, mac: string], boolean>("add_device");
+const addDevice = callable<[name: string, ip: string, mac: string], AddDeviceResult>("add_device");
 const removeDevice = callable<[ip: string], boolean>("remove_device");
 const setTvIp = callable<[tvIp: string], boolean>("set_tv_ip");
 const pingDevice = callable<[ip: string], PingResult>("ping_device");
@@ -56,6 +56,13 @@ interface StatusResult {
 interface PingResult {
   status: string;
   hostname?: string;
+  mac?: string;
+}
+
+interface AddDeviceResult {
+  status: string;
+  mac?: string;
+  message?: string;
 }
 
 interface GameInfo {
@@ -89,15 +96,22 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
   const [name, setName] = useState("");
   const [ip, setIp] = useState("");
   const [mac, setMac] = useState("");
+  const [adding, setAdding] = useState(false);
 
   const handleAdd = async () => {
-    if (!name || !ip || !mac) {
-      toaster.toast({ title: "Missing fields", body: "Please fill in all fields" });
+    if (!name || !ip) {
+      toaster.toast({ title: "Missing fields", body: "Name and IP are required" });
       return;
     }
-    await addDevice(name, ip, mac);
-    toaster.toast({ title: "Device added", body: `${name} (${ip})` });
-    onAdd();
+    setAdding(true);
+    const result = await addDevice(name, ip, mac);
+    setAdding(false);
+    if (result.status === "ok") {
+      toaster.toast({ title: "Device added", body: `${name} (${ip}) - MAC: ${result.mac}` });
+      onAdd();
+    } else {
+      toaster.toast({ title: "Error", body: result.message || "Failed to add device" });
+    }
   };
 
   return (
@@ -109,11 +123,15 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
         <TextField label="IP Address" value={ip} onChange={(e) => setIp(e.target.value)} />
       </PanelSectionRow>
       <PanelSectionRow>
-        <TextField label="MAC Address" value={mac} onChange={(e) => setMac(e.target.value)} />
+        <TextField
+          label="MAC Address (auto-detected if empty)"
+          value={mac}
+          onChange={(e) => setMac(e.target.value)}
+        />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={handleAdd}>
-          Save Device
+        <ButtonItem layout="below" disabled={adding} onClick={handleAdd}>
+          {adding ? "Detecting MAC..." : "Save Device"}
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>

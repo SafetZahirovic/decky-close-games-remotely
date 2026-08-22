@@ -113,6 +113,75 @@ class MiniHTTPServer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def resolve_mac(ip: str) -> str | None:
+    """Resolve MAC address from IP via ARP table. Pings first to ensure ARP entry exists."""
+    import subprocess
+    try:
+        # Ping to populate ARP cache (device must be online for this to work)
+        subprocess.run(["ping", "-c", "1", "-W", "1", ip],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except Exception:
+        pass
+    try:
+        # Read ARP table
+        result = subprocess.run(["ip", "neigh", "show", ip],
+                                capture_output=True, text=True, timeout=5)
+        # Format: "192.168.1.10 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+        for line in result.stdout.strip().split("\n"):
+            if "lladdr" in line:
+                parts = line.split()
+                idx = parts.index("lladdr")
+                return parts[idx + 1]
+    except Exception:
+        pass
+    # Fallback: try /proc/net/arp (older systems)
+    try:
+        with open("/proc/net/arp", "r") as f:
+            for line in f:
+                if line.startswith(ip + " ") or line.startswith(ip + "\t"):
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
+                        return parts[3]
+    except Exception:
+        pass
+    return None
+
+
+def get_local_mac() -> str:
+    """Get the MAC address of the default network interface."""
+    import subprocess
+    try:
+        # Get the default route interface
+        result = subprocess.run(
+            ["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5
+        )
+        iface = None
+        for part in result.stdout.split():
+            if part == "dev":
+                continue
+            # The word after "dev" is the interface name
+        parts = result.stdout.split()
+        if "dev" in parts:
+            iface = parts[parts.index("dev") + 1]
+        if iface:
+            with open(f"/sys/class/net/{iface}/address", "r") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    # Fallback: first non-lo interface
+    try:
+        for name in os.listdir("/sys/class/net"):
+            if name == "lo":
+                continue
+            with open(f"/sys/class/net/{name}/address", "r") as f:
+                mac = f.read().strip()
+                if mac and mac != "00:00:00:00:00:00":
+                    return mac
+    except Exception:
+        pass
+    return ""
+
+
 def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
     """Send Wake-on-LAN magic packets to multiple destinations (like MoonDeck)."""
     mac_bytes = bytes.fromhex(mac_address.replace(":", "").replace("-", ""))
@@ -377,7 +446,9 @@ class Plugin:
 
         @self.http_server.route("GET", "/ping")
         async def handle_ping(_body):
-            return {"status": "ok", "hostname": socket.gethostname()}
+            # Include this device's MAC so the remote plugin can store it
+            mac = get_local_mac()
+            return {"status": "ok", "hostname": socket.gethostname(), "mac": mac}
 
         @self.http_server.route("GET", "/status")
         async def handle_status(_body):
@@ -422,19 +493,36 @@ class Plugin:
         save_settings(settings)
         return True
 
-    async def add_device(self, name: str, ip: str, mac: str) -> bool:
+    async def add_device(self, name: str, ip: str, mac: str = "") -> dict:
+        loop = asyncio.get_event_loop()
+        # Auto-resolve MAC if not provided
+        if not mac:
+            resolved = await loop.run_in_executor(None, resolve_mac, ip)
+            if resolved:
+                mac = resolved
+                decky.logger.info(f"Auto-resolved MAC for {ip}: {mac}")
+            else:
+                return {"status": "error", "message": f"Could not resolve MAC for {ip}. Is the device online?"}
+
         devices = self.settings.get("devices", [])
-        # Update existing or add new
         for d in devices:
             if d["ip"] == ip:
                 d["name"] = name
                 d["mac"] = mac
                 save_settings(self.settings)
-                return True
+                return {"status": "ok", "mac": mac}
         devices.append({"name": name, "ip": ip, "mac": mac})
         self.settings["devices"] = devices
         save_settings(self.settings)
-        return True
+        return {"status": "ok", "mac": mac}
+
+    async def resolve_device_mac(self, ip: str) -> dict:
+        """Try to resolve MAC address for an IP."""
+        loop = asyncio.get_event_loop()
+        mac = await loop.run_in_executor(None, resolve_mac, ip)
+        if mac:
+            return {"status": "ok", "mac": mac}
+        return {"status": "error", "message": "Could not resolve MAC. Is the device online?"}
 
     async def remove_device(self, ip: str) -> bool:
         self.settings["devices"] = [
