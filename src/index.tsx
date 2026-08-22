@@ -11,17 +11,14 @@ import {
   PanelSection,
   PanelSectionRow,
   TextField,
-  ToggleField,
   staticClasses,
   Focusable,
   DialogButton,
-  Navigation,
 } from "@decky/ui";
 import { FaPowerOff, FaPlus, FaTrash, FaTv, FaDesktop, FaSyncAlt } from "react-icons/fa";
 
 // Backend callables
 const getSettings = callable<[], Settings>("get_settings");
-const saveAllSettings = callable<[settings: Settings], boolean>("save_all_settings");
 const addDevice = callable<[name: string, ip: string, mac: string], boolean>("add_device");
 const removeDevice = callable<[ip: string], boolean>("remove_device");
 const setTvIp = callable<[tvIp: string], boolean>("set_tv_ip");
@@ -29,7 +26,6 @@ const pingDevice = callable<[ip: string], PingResult>("ping_device");
 const wakeDevice = callable<[mac: string], StatusResult>("wake_device");
 const getRemoteStatus = callable<[ip: string], RemoteStatus>("get_remote_status");
 const closeRemoteGames = callable<[ip: string], CloseResult>("close_remote_games");
-const shutdownRemote = callable<[ip: string], StatusResult>("shutdown_remote");
 const nukeDevice = callable<
   [ip: string, mac: string, shutdownAfter: boolean, turnOffTv: boolean],
   NukeResult
