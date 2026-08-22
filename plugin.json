@@ -1,0 +1,10 @@
+{
+  "name": "Close Games Remotely",
+  "author": "safetzahirovic",
+  "flags": ["_root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility", "remote", "cloud-save"],
+    "description": "Remotely close games on other Steam devices so Steam Cloud saves can sync."
+  }
+}
