@@ -375,15 +375,20 @@ import base64
 import ssl
 
 
-async def _ws_connect(tv_ip: str):
-    """Try to open a WebSocket connection to the TV. Tries port 3000, then 3001 (SSL)."""
-    # Try plain WebSocket on port 3000
-    for port, use_ssl in [(3000, False), (3001, True)]:
+async def _ws_connect(tv_ip: str) -> tuple:
+    """Try to open a WebSocket connection to the TV.
+    Tries port 3001 (SSL) first (newer TVs require it), then port 3000 (plain)."""
+    errors = []
+
+    # Try SSL first (port 3001) — most modern LG TVs require this
+    for port, use_ssl in [(3001, True), (3000, False)]:
         try:
             if use_ssl:
                 ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
+                # Allow older TLS versions for compatibility with older TV firmware
+                ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(tv_ip, port, ssl=ssl_ctx), timeout=5
                 )
@@ -397,6 +402,7 @@ async def _ws_connect(tv_ip: str):
             handshake = (
                 f"GET / HTTP/1.1\r\n"
                 f"Host: {tv_ip}:{port}\r\n"
+                f"Origin: https://{tv_ip}:{port}\r\n"
                 f"Upgrade: websocket\r\n"
                 f"Connection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {ws_key}\r\n"
@@ -409,13 +415,20 @@ async def _ws_connect(tv_ip: str):
             response = await asyncio.wait_for(reader.read(4096), timeout=5)
             if b"101" in response:
                 decky.logger.info(f"WebSocket connected to TV on port {port} ({'SSL' if use_ssl else 'plain'})")
-                return reader, writer
-            writer.close()
+                return reader, writer, None
+            else:
+                resp_line = response.split(b"\r\n")[0].decode(errors="replace")
+                msg = f"Port {port} ({'SSL' if use_ssl else 'plain'}): handshake rejected ({resp_line})"
+                decky.logger.warning(msg)
+                errors.append(msg)
+                writer.close()
         except Exception as e:
-            decky.logger.warning(f"TV connection failed on port {port}: {e}")
+            msg = f"Port {port} ({'SSL' if use_ssl else 'plain'}): {e}"
+            decky.logger.warning(f"TV connection failed — {msg}")
+            errors.append(msg)
             continue
 
-    return None, None
+    return None, None, "; ".join(errors)
 
 
 def _ws_make_send(writer):
@@ -464,16 +477,16 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> 
     """Turn off an LG WebOS TV using the SSAP protocol over WebSocket.
     Tries port 3000 (plain) and 3001 (SSL). Optionally wakes the TV first via WOL."""
     # If TV is unreachable, try waking it first (some LG TVs support WOL in standby)
-    reader, writer = await _ws_connect(tv_ip)
+    reader, writer, errors = await _ws_connect(tv_ip)
 
     if not reader and tv_mac:
         decky.logger.info(f"TV unreachable, trying WOL to {tv_mac}...")
         send_wol(tv_mac, host_ip=tv_ip)
         await asyncio.sleep(5)
-        reader, writer = await _ws_connect(tv_ip)
+        reader, writer, errors = await _ws_connect(tv_ip)
 
     if not reader:
-        return {"status": "error", "message": f"Cannot connect to TV at {tv_ip} (tried ports 3000 and 3001). Is the TV on?"}
+        return {"status": "error", "message": f"Cannot connect to TV at {tv_ip}. {errors}"}
 
     try:
         ws_send = _ws_make_send(writer)
