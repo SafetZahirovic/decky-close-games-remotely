@@ -218,16 +218,14 @@ def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
 
 
 def get_running_games() -> list[dict]:
-    """Find running Steam game processes by scanning /proc for SteamAppId env var."""
-    games = []
-    seen_apps = set()
+    """Find ALL running Steam game processes, grouped by app ID."""
+    apps: dict[str, dict] = {}
     try:
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
                 continue
             try:
-                env_path = f"/proc/{entry}/environ"
-                with open(env_path, "rb") as f:
+                with open(f"/proc/{entry}/environ", "rb") as f:
                     environ = f.read()
                 if b"SteamAppId=" not in environ:
                     continue
@@ -236,50 +234,80 @@ def get_running_games() -> list[dict]:
                     if var.startswith(b"SteamAppId="):
                         app_id = var.split(b"=", 1)[1].decode()
                         break
-                if app_id and app_id != "0" and app_id not in seen_apps:
-                    # Try to get process name
+                if not app_id or app_id == "0":
+                    continue
+                pid = int(entry)
+                if app_id not in apps:
                     name = "unknown"
                     try:
                         with open(f"/proc/{entry}/comm", "r") as f:
                             name = f.read().strip()
                     except Exception:
                         pass
-                    seen_apps.add(app_id)
-                    games.append({
-                        "pid": int(entry),
-                        "app_id": app_id,
-                        "name": name,
-                    })
+                    apps[app_id] = {"app_id": app_id, "name": name, "pids": []}
+                apps[app_id]["pids"].append(pid)
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
     except Exception:
         pass
-    return games
+    return list(apps.values())
 
 
-def close_all_games() -> dict:
-    """Send SIGTERM to all running Steam game processes."""
-    games = get_running_games()
-    closed = []
+def _kill_all_game_pids(games: list[dict], sig: int) -> int:
+    """Send a signal to every PID in every game. Returns number of signals sent."""
+    count = 0
     for game in games:
-        try:
-            os.kill(game["pid"], signal.SIGTERM)
-            closed.append(game)
-            decky.logger.info(f"Sent SIGTERM to {game['name']} (AppId={game['app_id']}, PID={game['pid']})")
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            decky.logger.error(f"Failed to kill PID {game['pid']}: {e}")
-    return {"status": "ok", "closed": closed}
+        for pid in game["pids"]:
+            try:
+                os.kill(pid, sig)
+                count += 1
+                decky.logger.info(
+                    f"Sent {signal.Signals(sig).name} to PID {pid} "
+                    f"({game['name']}, AppId={game['app_id']})"
+                )
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                decky.logger.error(f"Failed to signal PID {pid}: {e}")
+    return count
 
 
-async def wait_for_games_to_exit(timeout: int = 30) -> bool:
-    """Wait until no game processes remain, up to timeout seconds."""
-    for _ in range(timeout):
-        if not get_running_games():
-            return True
+async def close_all_games() -> dict:
+    """Close all running Steam games. SIGTERM first, escalate to SIGKILL."""
+    games = get_running_games()
+    if not games:
+        return {"status": "ok", "closed": [], "total_pids": 0}
+
+    total_pids = sum(len(g["pids"]) for g in games)
+    game_names = [g["name"] for g in games]
+    decky.logger.info(f"Closing {len(games)} game(s) ({total_pids} processes): {game_names}")
+
+    # Phase 1: SIGTERM — give games a chance to save and exit
+    _kill_all_game_pids(games, signal.SIGTERM)
+
+    for i in range(15):
         await asyncio.sleep(1)
-    return False
+        if not get_running_games():
+            decky.logger.info("All games exited after SIGTERM")
+            return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGTERM"}
+
+    # Phase 2: SIGKILL — force kill anything still running
+    remaining = get_running_games()
+    if remaining:
+        rem_pids = sum(len(g["pids"]) for g in remaining)
+        decky.logger.warning(f"{len(remaining)} game(s) still running after SIGTERM, sending SIGKILL to {rem_pids} processes")
+        _kill_all_game_pids(remaining, signal.SIGKILL)
+
+        for i in range(5):
+            await asyncio.sleep(1)
+            if not get_running_games():
+                decky.logger.info("All games exited after SIGKILL")
+                return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGKILL"}
+
+    still = get_running_games()
+    if still:
+        return {"status": "partial", "closed": games, "remaining": still, "total_pids": total_pids}
+    return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGKILL"}
 
 
 def http_get(url: str, timeout: int = 5) -> dict | None:
@@ -292,7 +320,7 @@ def http_get(url: str, timeout: int = 5) -> dict | None:
         return None
 
 
-def http_post(url: str, data: dict | None = None, timeout: int = 10) -> dict | None:
+def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | None:
     """Synchronous HTTP POST, returns parsed JSON or None."""
     try:
         body = json.dumps(data or {}).encode()
@@ -457,10 +485,7 @@ class Plugin:
 
         @self.http_server.route("POST", "/close-all-games")
         async def handle_close_games(_body):
-            result = close_all_games()
-            # Wait for games to actually exit so cloud sync can happen
-            synced = await wait_for_games_to_exit(timeout=30)
-            result["cloud_sync_waited"] = synced
+            result = await close_all_games()
             return result
 
         @self.http_server.route("POST", "/shutdown")
@@ -608,10 +633,7 @@ class Plugin:
         return get_running_games()
 
     async def close_local_games(self) -> dict:
-        result = close_all_games()
-        synced = await wait_for_games_to_exit(timeout=30)
-        result["cloud_sync_waited"] = synced
-        return result
+        return await close_all_games()
 
     # ---- LG TV ------------------------------------------------------------
 
@@ -632,19 +654,25 @@ class Plugin:
 
     async def nuke_device(self, ip: str, mac: str, shutdown_after: bool = True, turn_off_tv: bool = False) -> dict:
         """
-        Full workflow: wake device -> wait for plugin -> close games -> shutdown -> TV off.
-        Emits progress events to the frontend.
+        Full workflow with structured step-by-step progress.
+        Steps: wake -> boot -> close -> sync -> tv -> sleep
         """
-        try:
-            await decky.emit("nuke_progress", "Sending wake-on-LAN...")
-            send_wol(mac, host_ip=ip)
+        loop = asyncio.get_event_loop()
 
-            # Wait for the remote plugin to come online, resending WOL every 10s
-            await decky.emit("nuke_progress", "Waiting for device to boot...")
-            loop = asyncio.get_event_loop()
+        async def step(name: str, status: str, detail: str = ""):
+            await decky.emit("nuke_step", name, status, detail)
+
+        try:
+            # Step 1: Wake device
+            await step("wake", "active", "Sending wake-on-LAN...")
+            send_wol(mac, host_ip=ip)
+            await step("wake", "done", "Magic packet sent")
+
+            # Step 2: Wait for device to boot
+            await step("boot", "active", "Waiting for device...")
             online = False
             since_last_wol = 0
-            for attempt in range(60):  # up to 120 seconds (60 * 2s sleep)
+            for attempt in range(60):
                 result = await loop.run_in_executor(
                     None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
                 )
@@ -656,44 +684,70 @@ class Plugin:
                 if since_last_wol >= 10:
                     send_wol(mac, host_ip=ip)
                     since_last_wol = 0
-                    decky.logger.info("Resending WOL packet...")
 
             if not online:
-                await decky.emit("nuke_progress", "ERROR: Device did not come online")
-                return {"status": "error", "message": "Device did not come online after WOL"}
+                await step("boot", "error", "Device did not come online")
+                return {"status": "error", "step": "boot"}
 
-            # Close all games
-            await decky.emit("nuke_progress", "Closing all games...")
+            hostname = result.get("hostname", ip)
+            await step("boot", "done", f"{hostname} is online")
+
+            # Step 3: Close all games
+            await step("close", "active", "Closing all games...")
             result = await loop.run_in_executor(
                 None, http_post, f"http://{ip}:{PLUGIN_PORT}/close-all-games"
             )
-            if not result or result.get("status") != "ok":
-                await decky.emit("nuke_progress", "ERROR: Failed to close games")
-                return {"status": "error", "message": "Failed to close games on remote device"}
 
-            closed_count = len(result.get("closed", []))
-            await decky.emit("nuke_progress", f"Closed {closed_count} game(s). Cloud syncing...")
+            if not result:
+                await step("close", "error", "Could not reach device")
+                return {"status": "error", "step": "close"}
 
-            # Give extra time for cloud sync
-            await asyncio.sleep(5)
+            closed = result.get("closed", [])
+            total_pids = result.get("total_pids", 0)
+            method = result.get("method", "")
+            close_status = result.get("status", "error")
 
-            # Shutdown if requested
-            if shutdown_after:
-                await decky.emit("nuke_progress", "Shutting down device...")
-                await loop.run_in_executor(
-                    None, http_post, f"http://{ip}:{PLUGIN_PORT}/shutdown"
-                )
+            if close_status == "ok":
+                if len(closed) > 0:
+                    names = ", ".join(g["name"] for g in closed)
+                    await step("close", "done", f"Closed {names} ({total_pids} processes)")
+                else:
+                    await step("close", "done", "No games were running")
+            elif close_status == "partial":
+                remaining = result.get("remaining", [])
+                rem_names = ", ".join(g["name"] for g in remaining)
+                await step("close", "error", f"Could not close: {rem_names}")
+                return {"status": "error", "step": "close"}
+            else:
+                await step("close", "error", "Failed to close games")
+                return {"status": "error", "step": "close"}
 
-            # Turn off TV if requested
+            # Step 4: Wait for cloud sync
+            await step("sync", "active", "Waiting for Steam Cloud sync...")
+            await asyncio.sleep(10)
+            await step("sync", "done", "Cloud save sync complete")
+
+            # Step 5: Turn off TV (if configured)
             if turn_off_tv:
-                await decky.emit("nuke_progress", "Turning off TV...")
+                await step("tv", "active", "Turning off TV...")
                 tv_result = await self.tv_off()
-                if tv_result.get("status") != "ok":
-                    await decky.emit("nuke_progress", f"TV: {tv_result.get('message', 'unknown error')}")
+                if tv_result.get("status") == "ok":
+                    await step("tv", "done", "TV is off")
+                else:
+                    await step("tv", "error", tv_result.get("message", "Failed"))
 
-            await decky.emit("nuke_progress", "Done!")
-            return {"status": "ok", "closed": closed_count}
+            # Step 6: Put device back to sleep
+            if shutdown_after:
+                await step("sleep", "active", "Putting device to sleep...")
+                await loop.run_in_executor(
+                    None, http_post, f"http://{ip}:{PLUGIN_PORT}/suspend"
+                )
+                await step("sleep", "done", "Device is sleeping")
+
+            await step("finished", "done", "All done!")
+            return {"status": "ok", "closed": len(closed)}
 
         except Exception as e:
-            await decky.emit("nuke_progress", f"ERROR: {str(e)}")
+            decky.logger.error(f"Nuke error: {e}")
+            await step("error", "error", str(e))
             return {"status": "error", "message": str(e)}

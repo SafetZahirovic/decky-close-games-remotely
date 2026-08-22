@@ -35,62 +35,81 @@ const getLocalGames = callable<[], GameInfo[]>("get_local_games");
 const closeLocalGames = callable<[], CloseResult>("close_local_games");
 
 // Types
-interface Device {
-  name: string;
-  ip: string;
-  mac: string;
-}
+interface Device { name: string; ip: string; mac: string }
+interface Settings { devices: Device[]; tv_ip: string; tv_client_key?: string; plugin_port?: number }
+interface StatusResult { status: string; message?: string }
+interface PingResult { status: string; hostname?: string; mac?: string }
+interface AddDeviceResult { status: string; mac?: string; message?: string }
+interface GameInfo { pid: number; app_id: string; name: string; pids?: number[] }
+interface RemoteStatus { status: string; games: GameInfo[]; hostname?: string }
+interface CloseResult { status: string; closed: GameInfo[]; total_pids?: number; method?: string }
+interface NukeResult { status: string; closed?: number; message?: string; step?: string }
 
-interface Settings {
-  devices: Device[];
-  tv_ip: string;
-  tv_client_key?: string;
-  plugin_port?: number;
-}
+// Step tracking for nuke progress
+interface StepState { status: "pending" | "active" | "done" | "error"; detail: string }
 
-interface StatusResult {
-  status: string;
-  message?: string;
-}
+const STEP_LABELS: Record<string, string> = {
+  wake: "Waking device",
+  boot: "Device booting",
+  close: "Closing games",
+  sync: "Cloud save sync",
+  tv: "Turning off TV",
+  sleep: "Putting to sleep",
+};
 
-interface PingResult {
-  status: string;
-  hostname?: string;
-  mac?: string;
-}
+const STEP_ICONS: Record<string, string> = {
+  pending: "\u2022",  // bullet
+  active: "\u23F3",   // hourglass
+  done: "\u2705",     // checkmark
+  error: "\u274C",    // cross
+};
 
-interface AddDeviceResult {
-  status: string;
-  mac?: string;
-  message?: string;
-}
-
-interface GameInfo {
-  pid: number;
-  app_id: string;
-  name: string;
-}
-
-interface RemoteStatus {
-  status: string;
-  games: GameInfo[];
-  hostname?: string;
-}
-
-interface CloseResult {
-  status: string;
-  closed: GameInfo[];
-  cloud_sync_waited?: boolean;
-}
-
-interface NukeResult {
-  status: string;
-  closed?: number;
-  message?: string;
+function initialSteps(hasTv: boolean): Record<string, StepState> {
+  const steps: Record<string, StepState> = {
+    wake: { status: "pending", detail: "" },
+    boot: { status: "pending", detail: "" },
+    close: { status: "pending", detail: "" },
+    sync: { status: "pending", detail: "" },
+  };
+  if (hasTv) steps.tv = { status: "pending", detail: "" };
+  steps.sleep = { status: "pending", detail: "" };
+  return steps;
 }
 
 // ---------------------------------------------------------------------------
-// Add Device form (shown inline)
+// Step progress display
+// ---------------------------------------------------------------------------
+function StepProgress({ steps }: { steps: Record<string, StepState> }) {
+  return (
+    <div style={{ padding: "4px 0" }}>
+      {Object.entries(steps).map(([key, step]) => {
+        const label = STEP_LABELS[key] || key;
+        const icon = STEP_ICONS[step.status];
+        const color =
+          step.status === "active" ? "#6bf" :
+          step.status === "done" ? "#6b6" :
+          step.status === "error" ? "#f66" :
+          "#666";
+        return (
+          <div key={key} style={{ fontSize: "12px", color, padding: "2px 0" }}>
+            <span style={{ marginRight: "6px" }}>{icon}</span>
+            <span style={{ fontWeight: step.status === "active" ? "bold" : "normal" }}>
+              {label}
+            </span>
+            {step.detail && (
+              <span style={{ color: "#8b929a", marginLeft: "6px" }}>
+                — {step.detail}
+              </span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Add Device form
 // ---------------------------------------------------------------------------
 function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () => void }) {
   const [name, setName] = useState("");
@@ -158,7 +177,7 @@ function DeviceCard({
   const [status, setStatus] = useState<string>("unknown");
   const [games, setGames] = useState<GameInfo[]>([]);
   const [busy, setBusy] = useState(false);
-  const [progress, setProgress] = useState("");
+  const [steps, setSteps] = useState<Record<string, StepState> | null>(null);
 
   const refreshStatus = useCallback(async () => {
     const result = await pingDevice(device.ip);
@@ -176,53 +195,81 @@ function DeviceCard({
     refreshStatus();
   }, [refreshStatus]);
 
-  // Listen for nuke progress events
+  // Listen for structured step events
   useEffect(() => {
-    const listener = addEventListener<[message: string]>("nuke_progress", (msg) => {
-      setProgress(msg);
-      if (msg.startsWith("Done") || msg.startsWith("ERROR")) {
-        setBusy(false);
-        refreshStatus();
+    const listener = addEventListener<[name: string, status: string, detail: string]>(
+      "nuke_step",
+      (stepName, stepStatus, detail) => {
+        setSteps((prev) => {
+          if (!prev) return prev;
+          if (stepName === "finished" || stepName === "error") {
+            setBusy(false);
+            refreshStatus();
+            // Keep steps visible for a moment, then clear
+            setTimeout(() => setSteps(null), 5000);
+            return prev;
+          }
+          return {
+            ...prev,
+            [stepName]: { status: stepStatus as StepState["status"], detail },
+          };
+        });
       }
-    });
+    );
     return () => {
-      removeEventListener("nuke_progress", listener);
+      removeEventListener("nuke_step", listener);
     };
   }, [refreshStatus]);
 
   const handleNuke = async () => {
-    setBusy(true);
-    setProgress("Starting...");
     const hasTv = tvIp !== "";
+    setBusy(true);
+    setSteps(initialSteps(hasTv));
     await nukeDevice(device.ip, device.mac, true, hasTv);
   };
 
   const handleCloseOnly = async () => {
     setBusy(true);
-    setProgress("Closing games...");
+    setSteps({
+      wake: { status: "pending", detail: "" },
+      boot: { status: "pending", detail: "" },
+      close: { status: "pending", detail: "" },
+    });
+
     if (status === "offline") {
-      setProgress("Waking device...");
+      setSteps((prev) => prev && { ...prev, wake: { status: "active", detail: "Sending WOL..." } });
       await wakeDevice(device.mac, device.ip);
-      // Wait for device
+      setSteps((prev) => prev && { ...prev, wake: { status: "done", detail: "" }, boot: { status: "active", detail: "Waiting..." } });
       for (let i = 0; i < 30; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         const ping = await pingDevice(device.ip);
         if (ping.status === "ok") break;
       }
+      setSteps((prev) => prev && { ...prev, boot: { status: "done", detail: "" } });
+    } else {
+      setSteps((prev) => prev && {
+        ...prev,
+        wake: { status: "done", detail: "Already online" },
+        boot: { status: "done", detail: "" },
+      });
     }
+
+    setSteps((prev) => prev && { ...prev, close: { status: "active", detail: "Closing games..." } });
     const result = await closeRemoteGames(device.ip);
     if (result.status === "ok") {
       const count = result.closed?.length || 0;
-      setProgress(`Closed ${count} game(s)`);
+      const names = result.closed?.map((g) => g.name).join(", ") || "";
+      setSteps((prev) => prev && { ...prev, close: { status: "done", detail: count > 0 ? `Closed ${names}` : "No games running" } });
       toaster.toast({ title: "Games closed", body: `${count} game(s) on ${device.name}` });
     } else {
-      setProgress("Failed to close games");
+      setSteps((prev) => prev && { ...prev, close: { status: "error", detail: "Failed to close games" } });
     }
     setBusy(false);
     refreshStatus();
+    setTimeout(() => setSteps(null), 5000);
   };
 
-  const statusIcon = status === "online" ? "🟢" : status === "offline" ? "🔴" : "⚪";
+  const statusIcon = status === "online" ? "\uD83D\uDFE2" : status === "offline" ? "\uD83D\uDD34" : "\u26AA";
 
   return (
     <PanelSection title={`${statusIcon} ${device.name}`}>
@@ -232,7 +279,7 @@ function DeviceCard({
         </div>
       </PanelSectionRow>
 
-      {games.length > 0 && (
+      {games.length > 0 && !busy && (
         <PanelSectionRow>
           <div style={{ fontSize: "12px", color: "#dca", marginBottom: "4px" }}>
             Running: {games.map((g) => g.name).join(", ")}
@@ -240,18 +287,16 @@ function DeviceCard({
         </PanelSectionRow>
       )}
 
-      {busy && progress && (
+      {steps && (
         <PanelSectionRow>
-          <div style={{ fontSize: "12px", color: "#6bf", marginBottom: "4px" }}>
-            {progress}
-          </div>
+          <StepProgress steps={steps} />
         </PanelSectionRow>
       )}
 
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={busy} onClick={handleNuke}>
           <FaPowerOff style={{ marginRight: "8px" }} />
-          Nuke (Close + Shutdown + TV Off)
+          Nuke (Close + Sync + TV Off + Sleep)
         </ButtonItem>
       </PanelSectionRow>
 
@@ -264,18 +309,10 @@ function DeviceCard({
 
       <PanelSectionRow>
         <Focusable style={{ display: "flex", gap: "8px" }}>
-          <DialogButton
-            style={{ flex: 1, minWidth: 0 }}
-            disabled={busy}
-            onClick={refreshStatus}
-          >
+          <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={busy} onClick={refreshStatus}>
             Refresh
           </DialogButton>
-          <DialogButton
-            style={{ flex: 1, minWidth: 0 }}
-            disabled={busy}
-            onClick={onRemove}
-          >
+          <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={busy} onClick={onRemove}>
             <FaTrash />
           </DialogButton>
         </Focusable>
@@ -352,7 +389,6 @@ function MainPanel() {
 
   return (
     <Fragment>
-      {/* Local games section */}
       {localGames.length > 0 && (
         <PanelSection title="This Device">
           <PanelSectionRow>
@@ -368,7 +404,6 @@ function MainPanel() {
         </PanelSection>
       )}
 
-      {/* Remote devices */}
       {settings.devices.map((device) => (
         <DeviceCard
           key={device.ip}
@@ -378,13 +413,9 @@ function MainPanel() {
         />
       ))}
 
-      {/* Add device */}
       {showAddForm ? (
         <AddDeviceForm
-          onAdd={() => {
-            setShowAddForm(false);
-            loadSettings();
-          }}
+          onAdd={() => { setShowAddForm(false); loadSettings(); }}
           onCancel={() => setShowAddForm(false)}
         />
       ) : (
@@ -398,7 +429,6 @@ function MainPanel() {
         </PanelSection>
       )}
 
-      {/* Settings toggle */}
       <PanelSection>
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={() => setShowSettings(!showSettings)}>
@@ -407,7 +437,6 @@ function MainPanel() {
         </PanelSectionRow>
       </PanelSection>
 
-      {/* Settings panel */}
       {showSettings && (
         <PanelSection title="LG TV">
           <PanelSectionRow>
