@@ -497,12 +497,21 @@ class Plugin:
         loop = asyncio.get_event_loop()
         # Auto-resolve MAC if not provided
         if not mac:
-            resolved = await loop.run_in_executor(None, resolve_mac, ip)
-            if resolved:
-                mac = resolved
-                decky.logger.info(f"Auto-resolved MAC for {ip}: {mac}")
+            # Best method: ask the remote plugin for its own MAC (most reliable)
+            ping_result = await loop.run_in_executor(
+                None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
+            )
+            if ping_result and ping_result.get("mac"):
+                mac = ping_result["mac"]
+                decky.logger.info(f"Got MAC from remote plugin for {ip}: {mac}")
             else:
-                return {"status": "error", "message": f"Could not resolve MAC for {ip}. Is the device online?"}
+                # Fallback: ARP resolution (less reliable, can return router MAC)
+                resolved = await loop.run_in_executor(None, resolve_mac, ip)
+                if resolved:
+                    mac = resolved
+                    decky.logger.info(f"ARP-resolved MAC for {ip}: {mac}")
+                else:
+                    return {"status": "error", "message": f"Could not resolve MAC for {ip}. Is the device online and plugin installed?"}
 
         devices = self.settings.get("devices", [])
         for d in devices:
@@ -515,14 +524,6 @@ class Plugin:
         self.settings["devices"] = devices
         save_settings(self.settings)
         return {"status": "ok", "mac": mac}
-
-    async def resolve_device_mac(self, ip: str) -> dict:
-        """Try to resolve MAC address for an IP."""
-        loop = asyncio.get_event_loop()
-        mac = await loop.run_in_executor(None, resolve_mac, ip)
-        if mac:
-            return {"status": "ok", "mac": mac}
-        return {"status": "error", "message": "Could not resolve MAC. Is the device online?"}
 
     async def remove_device(self, ip: str) -> bool:
         self.settings["devices"] = [
