@@ -22,6 +22,7 @@ const getSettings = callable<[], Settings>("get_settings");
 const addDevice = callable<[name: string, ip: string, mac: string], AddDeviceResult>("add_device");
 const removeDevice = callable<[ip: string], boolean>("remove_device");
 const setTvIp = callable<[tvIp: string], boolean>("set_tv_ip");
+const setTvMac = callable<[tvMac: string], boolean>("set_tv_mac");
 const pingDevice = callable<[ip: string], PingResult>("ping_device");
 const wakeDevice = callable<[mac: string, ip: string], StatusResult>("wake_device");
 const getRemoteStatus = callable<[ip: string], RemoteStatus>("get_remote_status");
@@ -36,7 +37,7 @@ const closeLocalGames = callable<[], CloseResult>("close_local_games");
 
 // Types
 interface Device { name: string; ip: string; mac: string }
-interface Settings { devices: Device[]; tv_ip: string; tv_client_key?: string; plugin_port?: number }
+interface Settings { devices: Device[]; tv_ip: string; tv_mac?: string; tv_client_key?: string; plugin_port?: number }
 interface StatusResult { status: string; message?: string }
 interface PingResult { status: string; hostname?: string; mac?: string }
 interface AddDeviceResult { status: string; mac?: string; message?: string }
@@ -330,6 +331,7 @@ function MainPanel() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [tvIpInput, setTvIpInput] = useState("");
+  const [tvMacInput, setTvMacInput] = useState("");
   const [localGames, setLocalGames] = useState<GameInfo[]>([]);
   const [closingLocal, setClosingLocal] = useState(false);
 
@@ -337,6 +339,7 @@ function MainPanel() {
     const s = await getSettings();
     setSettings(s);
     setTvIpInput(s.tv_ip || "");
+    setTvMacInput(s.tv_mac || "");
   }, []);
 
   const loadLocalGames = useCallback(async () => {
@@ -363,9 +366,10 @@ function MainPanel() {
     loadLocalGames();
   };
 
-  const handleSaveTvIp = async () => {
+  const handleSaveTv = async () => {
     await setTvIp(tvIpInput);
-    toaster.toast({ title: "TV IP saved", body: tvIpInput || "(cleared)" });
+    await setTvMac(tvMacInput);
+    toaster.toast({ title: "TV settings saved", body: tvIpInput || "(cleared)" });
     await loadSettings();
   };
 
@@ -448,8 +452,15 @@ function MainPanel() {
             />
           </PanelSectionRow>
           <PanelSectionRow>
+            <TextField
+              label="TV MAC Address (optional, for WOL wake)"
+              value={tvMacInput}
+              onChange={(e) => setTvMacInput(e.target.value)}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
             <Focusable style={{ display: "flex", gap: "8px" }}>
-              <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={handleSaveTvIp}>
+              <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={handleSaveTv}>
                 Save
               </DialogButton>
               <DialogButton

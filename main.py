@@ -375,68 +375,109 @@ import base64
 import ssl
 
 
-async def turn_off_lg_tv(tv_ip: str, client_key: str = "") -> dict:
-    """Turn off an LG WebOS TV using the SSAP protocol over raw WebSocket."""
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(tv_ip, 3000), timeout=5
-        )
-
-        # WebSocket handshake
-        ws_key = base64.b64encode(os.urandom(16)).decode()
-        handshake = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {tv_ip}:3000\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"\r\n"
-        )
-        writer.write(handshake.encode())
-        await writer.drain()
-
-        # Read handshake response
-        response = await asyncio.wait_for(reader.read(4096), timeout=5)
-        if b"101" not in response:
-            writer.close()
-            return {"status": "error", "message": "WebSocket handshake failed"}
-
-        # Helper: send WebSocket text frame
-        async def ws_send(data: str):
-            payload = data.encode()
-            frame = bytearray()
-            frame.append(0x81)  # FIN + text
-            length = len(payload)
-            mask_key = os.urandom(4)
-            if length < 126:
-                frame.append(0x80 | length)  # masked
-            elif length < 65536:
-                frame.append(0x80 | 126)
-                frame.extend(struct.pack(">H", length))
+async def _ws_connect(tv_ip: str):
+    """Try to open a WebSocket connection to the TV. Tries port 3000, then 3001 (SSL)."""
+    # Try plain WebSocket on port 3000
+    for port, use_ssl in [(3000, False), (3001, True)]:
+        try:
+            if use_ssl:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(tv_ip, port, ssl=ssl_ctx), timeout=5
+                )
             else:
-                frame.append(0x80 | 127)
-                frame.extend(struct.pack(">Q", length))
-            frame.extend(mask_key)
-            masked = bytearray(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-            frame.extend(masked)
-            writer.write(bytes(frame))
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(tv_ip, port), timeout=5
+                )
+
+            # WebSocket upgrade handshake
+            ws_key = base64.b64encode(os.urandom(16)).decode()
+            handshake = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: {tv_ip}:{port}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {ws_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"\r\n"
+            )
+            writer.write(handshake.encode())
             await writer.drain()
 
-        # Helper: receive WebSocket text frame
-        async def ws_recv() -> str:
-            header = await asyncio.wait_for(reader.read(2), timeout=10)
-            if len(header) < 2:
-                return ""
-            length = header[1] & 0x7F
-            if length == 126:
-                ext = await reader.read(2)
-                length = struct.unpack(">H", ext)[0]
-            elif length == 127:
-                ext = await reader.read(8)
-                length = struct.unpack(">Q", ext)[0]
-            data = await asyncio.wait_for(reader.read(length), timeout=10)
-            return data.decode()
+            response = await asyncio.wait_for(reader.read(4096), timeout=5)
+            if b"101" in response:
+                decky.logger.info(f"WebSocket connected to TV on port {port} ({'SSL' if use_ssl else 'plain'})")
+                return reader, writer
+            writer.close()
+        except Exception as e:
+            decky.logger.warning(f"TV connection failed on port {port}: {e}")
+            continue
+
+    return None, None
+
+
+def _ws_make_send(writer):
+    """Create a WebSocket send function."""
+    async def ws_send(data: str):
+        payload = data.encode()
+        frame = bytearray()
+        frame.append(0x81)  # FIN + text
+        length = len(payload)
+        mask_key = os.urandom(4)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack(">H", length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack(">Q", length))
+        frame.extend(mask_key)
+        masked = bytearray(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        frame.extend(masked)
+        writer.write(bytes(frame))
+        await writer.drain()
+    return ws_send
+
+
+def _ws_make_recv(reader):
+    """Create a WebSocket receive function."""
+    async def ws_recv() -> str:
+        header = await asyncio.wait_for(reader.read(2), timeout=10)
+        if len(header) < 2:
+            return ""
+        length = header[1] & 0x7F
+        if length == 126:
+            ext = await reader.read(2)
+            length = struct.unpack(">H", ext)[0]
+        elif length == 127:
+            ext = await reader.read(8)
+            length = struct.unpack(">Q", ext)[0]
+        data = await asyncio.wait_for(reader.read(length), timeout=10)
+        return data.decode()
+    return ws_recv
+
+
+async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> dict:
+    """Turn off an LG WebOS TV using the SSAP protocol over WebSocket.
+    Tries port 3000 (plain) and 3001 (SSL). Optionally wakes the TV first via WOL."""
+    # If TV is unreachable, try waking it first (some LG TVs support WOL in standby)
+    reader, writer = await _ws_connect(tv_ip)
+
+    if not reader and tv_mac:
+        decky.logger.info(f"TV unreachable, trying WOL to {tv_mac}...")
+        send_wol(tv_mac, host_ip=tv_ip)
+        await asyncio.sleep(5)
+        reader, writer = await _ws_connect(tv_ip)
+
+    if not reader:
+        return {"status": "error", "message": f"Cannot connect to TV at {tv_ip} (tried ports 3000 and 3001). Is the TV on?"}
+
+    try:
+        ws_send = _ws_make_send(writer)
+        ws_recv = _ws_make_recv(reader)
 
         # Register with the TV
         register_payload = {
@@ -464,15 +505,14 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "") -> dict:
 
         await ws_send(json.dumps(register_payload))
 
-        # Wait for registration response (may need TV prompt acceptance)
-        for _ in range(60):  # 60 second timeout for user to accept on TV
+        # Wait for registration response (may need TV prompt acceptance on first pair)
+        for _ in range(60):
             msg = await ws_recv()
             if not msg:
                 continue
             data = json.loads(msg)
             if data.get("type") == "registered":
                 new_key = data.get("payload", {}).get("client-key", client_key)
-                # Send power off
                 power_off = {
                     "type": "request",
                     "id": "power_off",
@@ -486,8 +526,12 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "") -> dict:
                 return {"status": "error", "message": data.get("error", "Unknown error")}
 
         writer.close()
-        return {"status": "error", "message": "Registration timed out (accept on TV?)"}
+        return {"status": "error", "message": "Registration timed out — accept pairing on TV?"}
     except Exception as e:
+        try:
+            writer.close()
+        except Exception:
+            pass
         return {"status": "error", "message": str(e)}
 
 
@@ -590,6 +634,11 @@ class Plugin:
         save_settings(self.settings)
         return True
 
+    async def set_tv_mac(self, tv_mac: str) -> bool:
+        self.settings["tv_mac"] = tv_mac
+        save_settings(self.settings)
+        return True
+
     async def set_tv_client_key(self, key: str) -> bool:
         self.settings["tv_client_key"] = key
         save_settings(self.settings)
@@ -671,7 +720,8 @@ class Plugin:
         if not tv_ip:
             return {"status": "error", "message": "No TV IP configured"}
         client_key = self.settings.get("tv_client_key", "")
-        result = await turn_off_lg_tv(tv_ip, client_key)
+        tv_mac = self.settings.get("tv_mac", "")
+        result = await turn_off_lg_tv(tv_ip, client_key, tv_mac=tv_mac)
         # Save the client key for future use (skip pairing next time)
         if result.get("client_key") and result["client_key"] != client_key:
             self.settings["tv_client_key"] = result["client_key"]
