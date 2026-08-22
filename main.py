@@ -218,7 +218,8 @@ def send_wol(mac_address: str, host_ip: str = "", port: int = 9):
 
 
 def get_running_games() -> list[dict]:
-    """Find ALL running Steam game processes, grouped by app ID."""
+    """Find ALL running Steam game processes, grouped by app ID.
+    Also collects process group IDs so we can kill entire process trees."""
     apps: dict[str, dict] = {}
     try:
         for entry in os.listdir("/proc"):
@@ -237,6 +238,11 @@ def get_running_games() -> list[dict]:
                 if not app_id or app_id == "0":
                     continue
                 pid = int(entry)
+                # Get process group ID
+                try:
+                    pgid = os.getpgid(pid)
+                except OSError:
+                    pgid = None
                 if app_id not in apps:
                     name = "unknown"
                     try:
@@ -244,70 +250,99 @@ def get_running_games() -> list[dict]:
                             name = f.read().strip()
                     except Exception:
                         pass
-                    apps[app_id] = {"app_id": app_id, "name": name, "pids": []}
+                    apps[app_id] = {"app_id": app_id, "name": name, "pids": [], "pgids": set()}
                 apps[app_id]["pids"].append(pid)
+                if pgid:
+                    apps[app_id]["pgids"].add(pgid)
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
     except Exception:
         pass
+    # Convert pgids sets to lists for JSON serialization
+    for app in apps.values():
+        app["pgids"] = list(app["pgids"])
     return list(apps.values())
 
 
-def _kill_all_game_pids(games: list[dict], sig: int) -> int:
-    """Send a signal to every PID in every game. Returns number of signals sent."""
-    count = 0
+def _kill_games(games: list[dict], sig: int):
+    """Kill games by process group first (catches all children), then individual PIDs as fallback."""
+    sig_name = signal.Signals(sig).name
+    killed_pgids: set[int] = set()
+
+    # Phase A: Kill entire process groups (this catches Wine/Proton/launcher/child processes)
+    for game in games:
+        for pgid in game.get("pgids", []):
+            if pgid in killed_pgids or pgid <= 1:
+                continue
+            try:
+                os.killpg(pgid, sig)
+                killed_pgids.add(pgid)
+                decky.logger.info(f"Sent {sig_name} to process group {pgid} ({game['name']}, AppId={game['app_id']})")
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                decky.logger.warning(f"Permission denied killing pgid {pgid}")
+            except Exception as e:
+                decky.logger.error(f"Failed to kill pgid {pgid}: {e}")
+
+    # Phase B: Kill individual PIDs that might have been missed
     for game in games:
         for pid in game["pids"]:
             try:
                 os.kill(pid, sig)
-                count += 1
-                decky.logger.info(
-                    f"Sent {signal.Signals(sig).name} to PID {pid} "
-                    f"({game['name']}, AppId={game['app_id']})"
-                )
+                decky.logger.info(f"Sent {sig_name} to PID {pid} ({game['name']})")
             except ProcessLookupError:
-                pass
+                pass  # Already dead from group kill
             except Exception as e:
-                decky.logger.error(f"Failed to signal PID {pid}: {e}")
-    return count
+                decky.logger.error(f"Failed to kill PID {pid}: {e}")
 
 
 async def close_all_games() -> dict:
-    """Close all running Steam games. SIGTERM first, escalate to SIGKILL."""
-    games = get_running_games()
-    if not games:
+    """Close all running Steam games with multiple rounds of scan-and-kill."""
+    initial_games = get_running_games()
+    if not initial_games:
         return {"status": "ok", "closed": [], "total_pids": 0}
 
-    total_pids = sum(len(g["pids"]) for g in games)
-    game_names = [g["name"] for g in games]
-    decky.logger.info(f"Closing {len(games)} game(s) ({total_pids} processes): {game_names}")
+    total_pids = sum(len(g["pids"]) for g in initial_games)
+    game_names = [g["name"] for g in initial_games]
+    decky.logger.info(f"Closing {len(initial_games)} game(s) ({total_pids} processes): {game_names}")
 
-    # Phase 1: SIGTERM — give games a chance to save and exit
-    _kill_all_game_pids(games, signal.SIGTERM)
+    # Round 1: SIGTERM process groups + PIDs
+    _kill_games(initial_games, signal.SIGTERM)
 
-    for i in range(15):
+    for _ in range(10):
         await asyncio.sleep(1)
         if not get_running_games():
             decky.logger.info("All games exited after SIGTERM")
-            return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGTERM"}
+            return {"status": "ok", "closed": initial_games, "total_pids": total_pids, "method": "SIGTERM"}
 
-    # Phase 2: SIGKILL — force kill anything still running
+    # Round 2: Re-scan (catches respawned/new processes) and SIGTERM again
+    respawned = get_running_games()
+    if respawned:
+        decky.logger.warning(f"Games still running after first SIGTERM, re-scanning and killing...")
+        _kill_games(respawned, signal.SIGTERM)
+        for _ in range(5):
+            await asyncio.sleep(1)
+            if not get_running_games():
+                decky.logger.info("All games exited after second SIGTERM")
+                return {"status": "ok", "closed": initial_games, "total_pids": total_pids, "method": "SIGTERM"}
+
+    # Round 3: SIGKILL everything still alive
     remaining = get_running_games()
     if remaining:
         rem_pids = sum(len(g["pids"]) for g in remaining)
-        decky.logger.warning(f"{len(remaining)} game(s) still running after SIGTERM, sending SIGKILL to {rem_pids} processes")
-        _kill_all_game_pids(remaining, signal.SIGKILL)
-
-        for i in range(5):
+        decky.logger.warning(f"SIGKILL {len(remaining)} game(s) ({rem_pids} processes)")
+        _kill_games(remaining, signal.SIGKILL)
+        for _ in range(5):
             await asyncio.sleep(1)
             if not get_running_games():
                 decky.logger.info("All games exited after SIGKILL")
-                return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGKILL"}
+                return {"status": "ok", "closed": initial_games, "total_pids": total_pids, "method": "SIGKILL"}
 
     still = get_running_games()
     if still:
-        return {"status": "partial", "closed": games, "remaining": still, "total_pids": total_pids}
-    return {"status": "ok", "closed": games, "total_pids": total_pids, "method": "SIGKILL"}
+        return {"status": "partial", "closed": initial_games, "remaining": still, "total_pids": total_pids}
+    return {"status": "ok", "closed": initial_games, "total_pids": total_pids, "method": "SIGKILL"}
 
 
 def http_get(url: str, timeout: int = 5) -> dict | None:
@@ -520,23 +555,16 @@ class Plugin:
 
     async def add_device(self, name: str, ip: str, mac: str = "") -> dict:
         loop = asyncio.get_event_loop()
-        # Auto-resolve MAC if not provided
+        # Try to auto-resolve MAC if not provided (best-effort, not required)
         if not mac:
-            # Best method: ask the remote plugin for its own MAC (most reliable)
+            # Best method: ask the remote plugin for its own MAC
             ping_result = await loop.run_in_executor(
                 None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
             )
             if ping_result and ping_result.get("mac"):
                 mac = ping_result["mac"]
                 decky.logger.info(f"Got MAC from remote plugin for {ip}: {mac}")
-            else:
-                # Fallback: ARP resolution (less reliable, can return router MAC)
-                resolved = await loop.run_in_executor(None, resolve_mac, ip)
-                if resolved:
-                    mac = resolved
-                    decky.logger.info(f"ARP-resolved MAC for {ip}: {mac}")
-                else:
-                    return {"status": "error", "message": f"Could not resolve MAC for {ip}. Is the device online and plugin installed?"}
+            # MAC is optional — WOL just won't work without it
 
         devices = self.settings.get("devices", [])
         for d in devices:
@@ -663,31 +691,45 @@ class Plugin:
             await decky.emit("nuke_step", name, status, detail)
 
         try:
-            # Step 1: Wake device
-            await step("wake", "active", "Sending wake-on-LAN...")
-            send_wol(mac, host_ip=ip)
-            await step("wake", "done", "Magic packet sent")
+            # Step 1: Check if device is already online
+            result = await loop.run_in_executor(
+                None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
+            )
+            already_online = result and result.get("status") == "ok"
 
-            # Step 2: Wait for device to boot
-            await step("boot", "active", "Waiting for device...")
-            online = False
-            since_last_wol = 0
-            for attempt in range(60):
-                result = await loop.run_in_executor(
-                    None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
-                )
-                if result and result.get("status") == "ok":
-                    online = True
-                    break
-                await asyncio.sleep(2)
-                since_last_wol += 2
-                if since_last_wol >= 10:
-                    send_wol(mac, host_ip=ip)
-                    since_last_wol = 0
+            if already_online:
+                await step("wake", "done", "Already online")
+                await step("boot", "done", result.get("hostname", ip))
+            elif mac:
+                # Wake device via WOL
+                await step("wake", "active", "Sending wake-on-LAN...")
+                send_wol(mac, host_ip=ip)
+                await step("wake", "done", "Magic packet sent")
 
-            if not online:
-                await step("boot", "error", "Device did not come online")
-                return {"status": "error", "step": "boot"}
+                # Wait for device to boot, resending WOL every 10s
+                await step("boot", "active", "Waiting for device...")
+                online = False
+                since_last_wol = 0
+                for attempt in range(60):
+                    result = await loop.run_in_executor(
+                        None, http_get, f"http://{ip}:{PLUGIN_PORT}/ping"
+                    )
+                    if result and result.get("status") == "ok":
+                        online = True
+                        break
+                    await asyncio.sleep(2)
+                    since_last_wol += 2
+                    if since_last_wol >= 10:
+                        send_wol(mac, host_ip=ip)
+                        since_last_wol = 0
+
+                if not online:
+                    await step("boot", "error", "Device did not come online")
+                    return {"status": "error", "step": "boot"}
+            else:
+                await step("wake", "error", "No MAC address — cannot wake device")
+                await step("boot", "error", "Device is offline and WOL not available")
+                return {"status": "error", "step": "wake"}
 
             hostname = result.get("hostname", ip)
             await step("boot", "done", f"{hostname} is online")

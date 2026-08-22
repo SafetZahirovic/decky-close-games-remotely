@@ -126,7 +126,8 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
     const result = await addDevice(name, ip, mac);
     setAdding(false);
     if (result.status === "ok") {
-      toaster.toast({ title: "Device added", body: `${name} (${ip}) - MAC: ${result.mac}` });
+      const macMsg = result.mac ? `MAC: ${result.mac}` : "No MAC — WOL disabled";
+      toaster.toast({ title: "Device added", body: `${name} (${ip}) — ${macMsg}` });
       onAdd();
     } else {
       toaster.toast({ title: "Error", body: result.message || "Failed to add device" });
@@ -143,7 +144,7 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
       </PanelSectionRow>
       <PanelSectionRow>
         <TextField
-          label="MAC Address (auto-detected if empty)"
+          label="MAC Address (optional, needed for WOL)"
           value={mac}
           onChange={(e) => setMac(e.target.value)}
         />
@@ -275,7 +276,7 @@ function DeviceCard({
     <PanelSection title={`${statusIcon} ${device.name}`}>
       <PanelSectionRow>
         <div style={{ fontSize: "12px", color: "#8b929a", marginBottom: "4px" }}>
-          {device.ip} | {device.mac}
+          {device.ip}{device.mac ? ` | ${device.mac}` : " | No MAC (WOL disabled)"}
         </div>
       </PanelSectionRow>
 
