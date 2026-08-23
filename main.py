@@ -565,7 +565,7 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> 
         ws_send = _ws_make_send(writer)
         ws_recv = _ws_make_recv(reader)
 
-        # Register with the TV
+        # Full LG WebOS registration manifest (pre-signed, used by all LG TV control tools)
         register_payload = {
             "type": "register",
             "id": "register_0",
@@ -579,10 +579,77 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> 
                         "created": "20140509",
                         "appId": "com.lge.test",
                         "vendorId": "com.lge",
-                        "localizedAppNames": {"": "Decky Remote"},
+                        "localizedAppNames": {
+                            "": "LG Remote App",
+                            "ko-KR": "\ub9ac\ubaa8\ucee8 \uc571",
+                            "zxx-XX": "\u041b\u0413 R\u044d\u043c\u043e\u0442\u044d A\u041f\u041f",
+                        },
+                        "localizedVendorNames": {"": "LG Electronics"},
+                        "permissions": [
+                            "TEST_SECURE",
+                            "CONTROL_INPUT_TEXT",
+                            "CONTROL_MOUSE_AND_KEYBOARD",
+                            "READ_INSTALLED_APPS",
+                            "READ_LGE_SDX",
+                            "READ_NOTIFICATIONS",
+                            "SEARCH",
+                            "WRITE_SETTINGS",
+                            "WRITE_NOTIFICATION_ALERT",
+                            "CONTROL_POWER",
+                            "READ_CURRENT_CHANNEL",
+                            "READ_RUNNING_APPS",
+                            "READ_UPDATE_INFO",
+                            "UPDATE_FROM_REMOTE_APP",
+                            "READ_LGE_TV_INPUT_EVENTS",
+                            "READ_TV_CURRENT_TIME",
+                        ],
+                        "serial": "2f930e2d2cfe083771f68e4fe3088fc1",
                     },
-                    "permissions": ["CONTROL_POWER"],
-                    "signatures": [{"signatureVersion": 1, "signature": ""}],
+                    "permissions": [
+                        "LAUNCH",
+                        "LAUNCH_WEBAPP",
+                        "APP_TO_APP",
+                        "CLOSE",
+                        "TEST_OPEN",
+                        "TEST_PROTECTED",
+                        "CONTROL_AUDIO",
+                        "CONTROL_DISPLAY",
+                        "CONTROL_INPUT_JOYSTICK",
+                        "CONTROL_INPUT_MEDIA_RECORDING",
+                        "CONTROL_INPUT_MEDIA_PLAYBACK",
+                        "CONTROL_INPUT_TV",
+                        "CONTROL_POWER",
+                        "READ_APP_STATUS",
+                        "READ_CURRENT_CHANNEL",
+                        "READ_INPUT_DEVICE_LIST",
+                        "READ_NETWORK_STATE",
+                        "READ_RUNNING_APPS",
+                        "READ_TV_CHANNEL_LIST",
+                        "WRITE_NOTIFICATION_TOAST",
+                        "READ_POWER_STATE",
+                        "READ_COUNTRY_INFO",
+                        "READ_SETTINGS",
+                        "CONTROL_TV_SCREEN",
+                        "CONTROL_TV_STANBY",
+                        "CONTROL_FAVORITE_GROUP",
+                        "CONTROL_USER_INFO",
+                        "CHECK_BLUETOOTH_DEVICE",
+                        "CONTROL_BLUETOOTH",
+                        "CONTROL_TIMER_INFO",
+                        "STB_INTERNAL_CONNECTION",
+                        "CONTROL_RECORDING",
+                        "READ_RECORDING_STATE",
+                        "WRITE_RECORDING_LIST",
+                        "READ_RECORDING_LIST",
+                        "READ_RECORDING_SCHEDULE",
+                        "WRITE_RECORDING_SCHEDULE",
+                    ],
+                    "signatures": [
+                        {
+                            "signatureVersion": 1,
+                            "signature": "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbmctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRyaMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQojoa7NQnAtw==",
+                        }
+                    ],
                 },
             },
         }
@@ -590,29 +657,61 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> 
             register_payload["payload"]["client-key"] = client_key
 
         await ws_send(json.dumps(register_payload))
+        decky.logger.info(f"Sent registration to TV (client_key={'yes' if client_key else 'none'})")
 
-        # Wait for registration response (may need TV prompt acceptance on first pair)
-        for _ in range(60):
-            msg = await ws_recv()
+        # Wait for registration response
+        # First time: TV shows pairing prompt on screen, user must accept
+        # Subsequent times: TV accepts stored client-key immediately
+        for _ in range(120):  # 2 minutes for user to accept on TV
+            try:
+                msg = await ws_recv()
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                continue
             if not msg:
                 continue
-            data = json.loads(msg)
-            if data.get("type") == "registered":
+            try:
+                data = json.loads(msg)
+            except json.JSONDecodeError:
+                decky.logger.warning(f"TV sent non-JSON: {msg[:100]}")
+                continue
+
+            msg_type = data.get("type", "")
+            decky.logger.info(f"TV response: type={msg_type}")
+
+            if msg_type == "registered":
                 new_key = data.get("payload", {}).get("client-key", client_key)
+                decky.logger.info("TV registered successfully, sending power off")
                 power_off = {
                     "type": "request",
                     "id": "power_off",
                     "uri": "ssap://system/turnOff",
                 }
                 await ws_send(json.dumps(power_off))
+                # Read the response to confirm
+                try:
+                    resp = await ws_recv()
+                    decky.logger.info(f"Power off response: {resp[:200] if resp else 'none'}")
+                except Exception:
+                    pass
                 writer.close()
                 return {"status": "ok", "client_key": new_key}
-            elif data.get("type") == "error":
+            elif msg_type == "response":
+                # TV is showing pairing prompt — keep waiting for user to accept
+                decky.logger.info("TV showing pairing prompt — waiting for user to accept...")
+                continue
+            elif msg_type == "error":
+                error_msg = data.get("error", "Unknown error")
                 writer.close()
-                return {"status": "error", "message": data.get("error", "Unknown error")}
+                return {"status": "error", "message": f"TV rejected: {error_msg}"}
 
         writer.close()
-        return {"status": "error", "message": "Registration timed out — accept pairing on TV?"}
+        return {"status": "error", "message": "Registration timed out — accept pairing on TV screen"}
+    except asyncio.IncompleteReadError:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        return {"status": "error", "message": "TV closed connection. Try again — the TV may need to be paired first."}
     except Exception as e:
         try:
             writer.close()
