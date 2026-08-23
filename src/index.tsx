@@ -14,15 +14,14 @@ import {
   staticClasses,
   Focusable,
   DialogButton,
+  ToggleField,
 } from "@decky/ui";
-import { FaPowerOff, FaPlus, FaTrash, FaTv, FaDesktop, FaSyncAlt } from "react-icons/fa";
+import { FaPowerOff, FaPlus, FaTrash, FaDesktop, FaSyncAlt } from "react-icons/fa";
 
 // Backend callables
 const getSettings = callable<[], Settings>("get_settings");
 const addDevice = callable<[name: string, ip: string, mac: string], AddDeviceResult>("add_device");
 const removeDevice = callable<[ip: string], boolean>("remove_device");
-const setTvIp = callable<[tvIp: string], boolean>("set_tv_ip");
-const setTvMac = callable<[tvMac: string], boolean>("set_tv_mac");
 const pingDevice = callable<[ip: string], PingResult>("ping_device");
 const wakeDevice = callable<[mac: string, ip: string], StatusResult>("wake_device");
 const getRemoteStatus = callable<[ip: string], RemoteStatus>("get_remote_status");
@@ -31,13 +30,12 @@ const nukeDevice = callable<
   [ip: string, mac: string, shutdownAfter: boolean, turnOffTv: boolean],
   NukeResult
 >("nuke_device");
-const tvOff = callable<[], StatusResult>("tv_off");
 const getLocalGames = callable<[], GameInfo[]>("get_local_games");
 const closeLocalGames = callable<[], CloseResult>("close_local_games");
 
 // Types
 interface Device { name: string; ip: string; mac: string }
-interface Settings { devices: Device[]; tv_ip: string; tv_mac?: string; tv_client_key?: string; plugin_port?: number }
+interface Settings { devices: Device[]; plugin_port?: number }
 interface StatusResult { status: string; message?: string }
 interface PingResult { status: string; hostname?: string; mac?: string }
 interface AddDeviceResult { status: string; mac?: string; message?: string }
@@ -46,7 +44,6 @@ interface RemoteStatus { status: string; games: GameInfo[]; hostname?: string }
 interface CloseResult { status: string; closed: GameInfo[]; total_pids?: number; method?: string }
 interface NukeResult { status: string; closed?: number; message?: string; step?: string }
 
-// Step tracking for nuke progress
 interface StepState { status: "pending" | "active" | "done" | "error"; detail: string }
 
 const STEP_LABELS: Record<string, string> = {
@@ -59,10 +56,10 @@ const STEP_LABELS: Record<string, string> = {
 };
 
 const STEP_ICONS: Record<string, string> = {
-  pending: "\u2022",  // bullet
-  active: "\u23F3",   // hourglass
-  done: "\u2705",     // checkmark
-  error: "\u274C",    // cross
+  pending: "\u2022",
+  active: "\u23F3",
+  done: "\u2705",
+  error: "\u274C",
 };
 
 function initialSteps(hasTv: boolean): Record<string, StepState> {
@@ -77,9 +74,6 @@ function initialSteps(hasTv: boolean): Record<string, StepState> {
   return steps;
 }
 
-// ---------------------------------------------------------------------------
-// Step progress display
-// ---------------------------------------------------------------------------
 function StepProgress({ steps }: { steps: Record<string, StepState> }) {
   return (
     <div style={{ padding: "4px 0" }}>
@@ -89,19 +83,12 @@ function StepProgress({ steps }: { steps: Record<string, StepState> }) {
         const color =
           step.status === "active" ? "#6bf" :
           step.status === "done" ? "#6b6" :
-          step.status === "error" ? "#f66" :
-          "#666";
+          step.status === "error" ? "#f66" : "#666";
         return (
           <div key={key} style={{ fontSize: "12px", color, padding: "2px 0" }}>
             <span style={{ marginRight: "6px" }}>{icon}</span>
-            <span style={{ fontWeight: step.status === "active" ? "bold" : "normal" }}>
-              {label}
-            </span>
-            {step.detail && (
-              <span style={{ color: "#8b929a", marginLeft: "6px" }}>
-                — {step.detail}
-              </span>
-            )}
+            <span style={{ fontWeight: step.status === "active" ? "bold" : "normal" }}>{label}</span>
+            {step.detail && <span style={{ color: "#8b929a", marginLeft: "6px" }}>— {step.detail}</span>}
           </div>
         );
       })}
@@ -144,11 +131,7 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
         <TextField label="IP Address" value={ip} onChange={(e) => setIp(e.target.value)} />
       </PanelSectionRow>
       <PanelSectionRow>
-        <TextField
-          label="MAC Address (optional, needed for WOL)"
-          value={mac}
-          onChange={(e) => setMac(e.target.value)}
-        />
+        <TextField label="MAC Address (optional, needed for WOL)" value={mac} onChange={(e) => setMac(e.target.value)} />
       </PanelSectionRow>
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={adding} onClick={handleAdd}>
@@ -156,9 +139,7 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={onCancel}>
-          Cancel
-        </ButtonItem>
+        <ButtonItem layout="below" onClick={onCancel}>Cancel</ButtonItem>
       </PanelSectionRow>
     </PanelSection>
   );
@@ -167,19 +148,12 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
 // ---------------------------------------------------------------------------
 // Device card
 // ---------------------------------------------------------------------------
-function DeviceCard({
-  device,
-  onRemove,
-  tvIp,
-}: {
-  device: Device;
-  onRemove: () => void;
-  tvIp: string;
-}) {
+function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void }) {
   const [status, setStatus] = useState<string>("unknown");
   const [games, setGames] = useState<GameInfo[]>([]);
   const [busy, setBusy] = useState(false);
   const [steps, setSteps] = useState<Record<string, StepState> | null>(null);
+  const [cecEnabled, setCecEnabled] = useState(true);
 
   const refreshStatus = useCallback(async () => {
     const result = await pingDevice(device.ip);
@@ -193,11 +167,8 @@ function DeviceCard({
     }
   }, [device.ip]);
 
-  useEffect(() => {
-    refreshStatus();
-  }, [refreshStatus]);
+  useEffect(() => { refreshStatus(); }, [refreshStatus]);
 
-  // Listen for structured step events
   useEffect(() => {
     const listener = addEventListener<[name: string, status: string, detail: string]>(
       "nuke_step",
@@ -207,27 +178,20 @@ function DeviceCard({
           if (stepName === "finished" || stepName === "error") {
             setBusy(false);
             refreshStatus();
-            // Keep steps visible for a moment, then clear
             setTimeout(() => setSteps(null), 5000);
             return prev;
           }
-          return {
-            ...prev,
-            [stepName]: { status: stepStatus as StepState["status"], detail },
-          };
+          return { ...prev, [stepName]: { status: stepStatus as StepState["status"], detail } };
         });
       }
     );
-    return () => {
-      removeEventListener("nuke_step", listener);
-    };
+    return () => { removeEventListener("nuke_step", listener); };
   }, [refreshStatus]);
 
   const handleNuke = async () => {
-    const hasTv = tvIp !== "";
     setBusy(true);
-    setSteps(initialSteps(hasTv));
-    await nukeDevice(device.ip, device.mac, true, hasTv);
+    setSteps(initialSteps(cecEnabled));
+    await nukeDevice(device.ip, device.mac, true, cecEnabled);
   };
 
   const handleCloseOnly = async () => {
@@ -296,9 +260,17 @@ function DeviceCard({
       )}
 
       <PanelSectionRow>
+        <ToggleField
+          label="Turn off TV (CEC)"
+          checked={cecEnabled}
+          onChange={setCecEnabled}
+        />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
         <ButtonItem layout="below" disabled={busy} onClick={handleNuke}>
           <FaPowerOff style={{ marginRight: "8px" }} />
-          Nuke (Close + Sync + TV Off + Sleep)
+          Nuke (Close + Sync{cecEnabled ? " + TV Off" : ""} + Sleep)
         </ButtonItem>
       </PanelSectionRow>
 
@@ -329,17 +301,12 @@ function DeviceCard({
 function MainPanel() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [tvIpInput, setTvIpInput] = useState("");
-  const [tvMacInput, setTvMacInput] = useState("");
   const [localGames, setLocalGames] = useState<GameInfo[]>([]);
   const [closingLocal, setClosingLocal] = useState(false);
 
   const loadSettings = useCallback(async () => {
     const s = await getSettings();
     setSettings(s);
-    setTvIpInput(s.tv_ip || "");
-    setTvMacInput(s.tv_mac || "");
   }, []);
 
   const loadLocalGames = useCallback(async () => {
@@ -347,10 +314,7 @@ function MainPanel() {
     setLocalGames(games);
   }, []);
 
-  useEffect(() => {
-    loadSettings();
-    loadLocalGames();
-  }, [loadSettings, loadLocalGames]);
+  useEffect(() => { loadSettings(); loadLocalGames(); }, [loadSettings, loadLocalGames]);
 
   const handleRemoveDevice = async (ip: string) => {
     await removeDevice(ip);
@@ -366,28 +330,10 @@ function MainPanel() {
     loadLocalGames();
   };
 
-  const handleSaveTv = async () => {
-    await setTvIp(tvIpInput);
-    await setTvMac(tvMacInput);
-    toaster.toast({ title: "TV settings saved", body: tvIpInput || "(cleared)" });
-    await loadSettings();
-  };
-
-  const handleTvOff = async () => {
-    const result = await tvOff();
-    if (result.status === "ok") {
-      toaster.toast({ title: "TV", body: "Turning off..." });
-    } else {
-      toaster.toast({ title: "TV Error", body: result.message || "Failed" });
-    }
-  };
-
   if (!settings) {
     return (
       <PanelSection title="Loading...">
-        <PanelSectionRow>
-          <div>Loading settings...</div>
-        </PanelSectionRow>
+        <PanelSectionRow><div>Loading settings...</div></PanelSectionRow>
       </PanelSection>
     );
   }
@@ -413,7 +359,6 @@ function MainPanel() {
         <DeviceCard
           key={device.ip}
           device={device}
-          tvIp={settings.tv_ip || ""}
           onRemove={() => handleRemoveDevice(device.ip)}
         />
       ))}
@@ -433,55 +378,10 @@ function MainPanel() {
           </PanelSectionRow>
         </PanelSection>
       )}
-
-      <PanelSection>
-        <PanelSectionRow>
-          <ButtonItem layout="below" onClick={() => setShowSettings(!showSettings)}>
-            {showSettings ? "Hide Settings" : "Settings"}
-          </ButtonItem>
-        </PanelSectionRow>
-      </PanelSection>
-
-      {showSettings && (
-        <PanelSection title="LG TV">
-          <PanelSectionRow>
-            <TextField
-              label="TV IP Address"
-              value={tvIpInput}
-              onChange={(e) => setTvIpInput(e.target.value)}
-            />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <TextField
-              label="TV MAC Address (optional, for WOL wake)"
-              value={tvMacInput}
-              onChange={(e) => setTvMacInput(e.target.value)}
-            />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <Focusable style={{ display: "flex", gap: "8px" }}>
-              <DialogButton style={{ flex: 1, minWidth: 0 }} onClick={handleSaveTv}>
-                Save
-              </DialogButton>
-              <DialogButton
-                style={{ flex: 1, minWidth: 0 }}
-                disabled={!settings.tv_ip}
-                onClick={handleTvOff}
-              >
-                <FaTv style={{ marginRight: "4px" }} />
-                TV Off
-              </DialogButton>
-            </Focusable>
-          </PanelSectionRow>
-        </PanelSection>
-      )}
     </Fragment>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Plugin entry
-// ---------------------------------------------------------------------------
 export default definePlugin(() => {
   return {
     name: "Close Games Remotely",
