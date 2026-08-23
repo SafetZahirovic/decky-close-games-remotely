@@ -41,7 +41,9 @@ All from the Quick Access Menu on your Steam Deck.
 1. Download the latest `close-games-remotely.zip` from [Releases](https://github.com/SafetZahirovic/decky-close-games-remotely/releases)
 2. In Decky Loader, go to the plugin browser and use "Install from ZIP"
 3. Install on **both** devices
-4. Open the plugin on one device and add the other device (name + IP address)
+4. Open the plugin on one device and add the other device (name + IP address + **MAC address**)
+
+**Important:** The MAC address is mandatory for the Nuke flow to work properly. The plugin needs it to send Wake-on-LAN packets to wake sleeping devices. Without a MAC address, the plugin cannot wake a device that is asleep or powered off. You can find the MAC address of your device in its network settings or by running `ip link` on the device.
 
 ## How It Works
 
