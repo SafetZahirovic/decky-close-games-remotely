@@ -363,10 +363,15 @@ def do_suspend() -> dict:
     except Exception:
         pass
 
+    # Log who we're running as
+    decky.logger.info(f"Running as uid={os.getuid()} euid={os.geteuid()}")
+
     commands = [
         # --force overrides inhibitors (Steam holds a suspend inhibitor)
-        ("systemctl-force", ["sudo", "systemctl", "suspend", "--force"]),
-        ("systemctl", ["sudo", "systemctl", "suspend"]),
+        ("systemctl-force", ["systemctl", "suspend", "--force"]),
+        ("systemctl", ["systemctl", "suspend"]),
+        # Direct kernel suspend (requires root)
+        ("kernel", ["sh", "-c", "echo mem > /sys/power/state"]),
     ]
 
     errors = []
