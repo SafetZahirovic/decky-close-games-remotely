@@ -363,25 +363,26 @@ def do_suspend() -> dict:
     except Exception:
         pass
 
-    # Log who we're running as
     decky.logger.info(f"Running as uid={os.getuid()} euid={os.geteuid()}")
 
+    # Clean environment — Decky's PyInstaller bundles LD_LIBRARY_PATH pointing
+    # to /tmp/_MEI... which breaks system binaries like systemctl
+    clean_env = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root"}
+
     commands = [
-        # --force overrides inhibitors (Steam holds a suspend inhibitor)
         ("systemctl-force", ["systemctl", "suspend", "--force"]),
         ("systemctl", ["systemctl", "suspend"]),
-        # Direct kernel suspend (requires root)
         ("kernel", ["sh", "-c", "echo mem > /sys/power/state"]),
     ]
 
     errors = []
     for name, cmd in commands:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, env=clean_env)
             decky.logger.info(f"Suspend ({name}): rc={result.returncode} out=[{result.stdout.strip()}] err=[{result.stderr.strip()}]")
             if result.returncode == 0:
                 return {"status": "suspending", "method": name}
-            errors.append(f"{name}:rc{result.returncode}:{result.stderr.strip()[:100]}")
+            errors.append(f"{name}:rc{result.returncode}:{result.stderr.strip()[:80]}")
         except subprocess.TimeoutExpired:
             return {"status": "suspending", "method": f"{name}(timeout=ok)"}
         except Exception as e:
@@ -396,13 +397,14 @@ def do_suspend() -> dict:
 def cec_standby() -> dict:
     """Turn off the TV via HDMI-CEC standby command."""
     import subprocess
+    clean_env = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root"}
     for cmd in [
         ["cec-ctl", "--standby", "-t0"],
         ["cec-ctl", "-d/dev/cec0", "--standby", "-t0"],
         ["cec-ctl", "--standby"],
     ]:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=clean_env)
             decky.logger.info(f"CEC {cmd}: rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
             if result.returncode == 0:
                 return {"status": "ok", "method": "cec", "command": " ".join(cmd)}
