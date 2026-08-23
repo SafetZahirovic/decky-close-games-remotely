@@ -288,12 +288,14 @@ function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void
           disabled={busy || status !== "online"}
           onClick={async () => {
             const result = await suspendRemote(device.ip);
+            const method = (result as any).method || "";
             if (result.status === "suspending") {
-              const method = (result as any).method || "unknown";
-              toaster.toast({ title: "Sleep", body: `${device.name} going to sleep (${method})` });
+              toaster.toast({ title: "Sleep", body: `${device.name} sleeping (${method})` });
               setTimeout(refreshStatus, 5000);
+            } else if (result.status === "error") {
+              toaster.toast({ title: "Sleep failed", body: result.message || "Failed" });
             } else {
-              toaster.toast({ title: "Sleep failed", body: result.message || "All suspend methods failed" });
+              toaster.toast({ title: "Sleep", body: `${device.name}: ${JSON.stringify(result)}` });
             }
           }}
         >

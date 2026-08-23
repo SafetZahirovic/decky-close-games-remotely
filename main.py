@@ -348,9 +348,9 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 def do_suspend() -> dict:
     """Put this device to sleep via D-Bus logind (same method as MoonDeck Buddy)."""
     import subprocess
+    errors = []
 
-    # Primary: D-Bus call to org.freedesktop.login1.Manager.Suspend(true)
-    # This is exactly what MoonDeck Buddy uses and works on SteamOS
+    # Method 1: dbus-send to org.freedesktop.login1.Manager.Suspend(true)
     try:
         result = subprocess.run([
             "dbus-send", "--system", "--print-reply",
@@ -359,22 +359,45 @@ def do_suspend() -> dict:
             "org.freedesktop.login1.Manager.Suspend",
             "boolean:true",
         ], capture_output=True, text=True, timeout=10)
-        decky.logger.info(f"Suspend (dbus logind): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
+        decky.logger.info(f"Suspend (dbus-send): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
         if result.returncode == 0:
-            return {"status": "suspending", "method": "dbus-logind"}
+            return {"status": "suspending", "method": "dbus-send"}
+        errors.append(f"dbus-send: rc={result.returncode} {result.stderr.strip()}")
+    except FileNotFoundError:
+        errors.append("dbus-send: not found")
     except Exception as e:
-        decky.logger.error(f"Suspend (dbus logind): {e}")
+        errors.append(f"dbus-send: {e}")
 
-    # Fallback: systemctl suspend
+    # Method 2: busctl (alternative D-Bus client, common on systemd systems)
+    try:
+        result = subprocess.run([
+            "busctl", "call", "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "Suspend", "b", "true",
+        ], capture_output=True, text=True, timeout=10)
+        decky.logger.info(f"Suspend (busctl): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
+        if result.returncode == 0:
+            return {"status": "suspending", "method": "busctl"}
+        errors.append(f"busctl: rc={result.returncode} {result.stderr.strip()}")
+    except FileNotFoundError:
+        errors.append("busctl: not found")
+    except Exception as e:
+        errors.append(f"busctl: {e}")
+
+    # Method 3: systemctl suspend
     try:
         result = subprocess.run(["systemctl", "suspend"], capture_output=True, text=True, timeout=10)
         decky.logger.info(f"Suspend (systemctl): rc={result.returncode}, err={result.stderr.strip()}")
         if result.returncode == 0:
             return {"status": "suspending", "method": "systemctl"}
+        errors.append(f"systemctl: rc={result.returncode} {result.stderr.strip()}")
     except Exception as e:
-        decky.logger.error(f"Suspend (systemctl): {e}")
+        errors.append(f"systemctl: {e}")
 
-    return {"status": "error", "message": "Suspend failed (tried dbus-logind and systemctl)"}
+    all_errors = "; ".join(errors)
+    decky.logger.error(f"All suspend methods failed: {all_errors}")
+    return {"status": "error", "message": f"All suspend methods failed: {all_errors}"}
 
 
 # ---------------------------------------------------------------------------
@@ -435,13 +458,11 @@ class Plugin:
 
         @self.http_server.route("POST", "/suspend")
         async def handle_suspend(_body):
-            # Schedule suspend after a short delay so the HTTP response goes out first
-            async def delayed_suspend():
-                await asyncio.sleep(2)
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, do_suspend)
-            asyncio.get_event_loop().create_task(delayed_suspend())
-            return {"status": "suspending"}
+            loop = asyncio.get_event_loop()
+            # Run do_suspend directly — if it works, the machine sleeps and
+            # the HTTP response may not arrive (client should handle timeout as success)
+            result = await loop.run_in_executor(None, do_suspend)
+            return result
 
         @self.http_server.route("POST", "/cec-standby")
         async def handle_cec_standby(_body):
@@ -516,8 +537,14 @@ class Plugin:
 
     async def suspend_remote(self, ip: str) -> dict:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, http_post, f"http://{ip}:{PLUGIN_PORT}/suspend")
-        return result if result else {"status": "error", "message": "Could not reach device"}
+        # Use a shorter timeout — if suspend works, the connection drops
+        result = await loop.run_in_executor(
+            None, lambda: http_post(f"http://{ip}:{PLUGIN_PORT}/suspend", timeout=15)
+        )
+        if result:
+            return result
+        # Timeout/connection drop likely means suspend worked
+        return {"status": "suspending", "method": "connection lost (likely suspended)"}
 
     async def cec_tv_off_remote(self, ip: str) -> dict:
         loop = asyncio.get_event_loop()
