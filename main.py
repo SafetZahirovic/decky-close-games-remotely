@@ -370,9 +370,10 @@ def do_suspend() -> dict:
     clean_env = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root"}
 
     commands = [
-        ("systemctl-force", ["systemctl", "suspend", "--force"]),
-        ("systemctl", ["systemctl", "suspend"]),
+        ("systemctl-force", ["systemctl", "suspend", "--force", "--no-ask-password"]),
+        ("loginctl", ["loginctl", "suspend"]),
         ("kernel", ["sh", "-c", "echo mem > /sys/power/state"]),
+        ("systemctl", ["systemctl", "suspend"]),
     ]
 
     errors = []
