@@ -346,36 +346,29 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 # Suspend / Sleep
 # ---------------------------------------------------------------------------
 def do_suspend() -> dict:
-    """Put this device to sleep. We run as root so we can write directly to /sys/power/state."""
+    """Put this device to sleep."""
     import subprocess
 
-    # Method 1: Direct kernel suspend (most reliable as root, bypasses D-Bus/polkit entirely)
-    try:
-        with open("/sys/power/state", "w") as f:
-            f.write("mem\n")
-        # If we get here, the machine woke back up from sleep
-        decky.logger.info("Suspend (/sys/power/state): success (resumed)")
-        return {"status": "suspending", "method": "/sys/power/state"}
-    except Exception as e:
-        decky.logger.error(f"Suspend (/sys/power/state): {e}")
-        err1 = str(e)
+    commands = [
+        ("sudo-mem", ["sudo", "sh", "-c", "echo mem > /sys/power/state"]),
+        ("sudo-systemctl", ["sudo", "systemctl", "suspend"]),
+        ("systemctl", ["systemctl", "suspend"]),
+    ]
 
-    # Method 2: systemctl suspend
-    try:
-        result = subprocess.run(
-            ["systemctl", "suspend"],
-            capture_output=True, text=True, timeout=15,
-            env={"PATH": "/usr/bin:/usr/sbin:/bin:/sbin"},
-        )
-        decky.logger.info(f"Suspend (systemctl): rc={result.returncode} err=[{result.stderr.strip()}]")
-        if result.returncode == 0:
-            return {"status": "suspending", "method": "systemctl"}
-    except subprocess.TimeoutExpired:
-        return {"status": "suspending", "method": "systemctl (timeout=success)"}
-    except Exception as e:
-        decky.logger.error(f"Suspend (systemctl): {e}")
+    errors = []
+    for name, cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            decky.logger.info(f"Suspend ({name}): rc={result.returncode} err=[{result.stderr.strip()}]")
+            if result.returncode == 0:
+                return {"status": "suspending", "method": name}
+            errors.append(f"{name}:rc{result.returncode}")
+        except subprocess.TimeoutExpired:
+            return {"status": "suspending", "method": f"{name}(timeout=ok)"}
+        except Exception as e:
+            errors.append(f"{name}:{e}")
 
-    return {"status": "error", "message": f"/sys/power/state: {err1}"}
+    return {"status": "error", "message": " | ".join(errors)}
 
 
 # ---------------------------------------------------------------------------
