@@ -343,6 +343,40 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 
 
 # ---------------------------------------------------------------------------
+# Suspend / Sleep
+# ---------------------------------------------------------------------------
+def do_suspend() -> dict:
+    """Put this device to sleep. Tries multiple methods for SteamOS compatibility."""
+    import subprocess
+
+    methods = [
+        # SteamOS-specific suspend helper
+        (["steamos-polkit-helpers/steamos-suspend"], "steamos-suspend"),
+        # Direct write to /sys/power/state (most reliable as root)
+        (["sh", "-c", "echo mem > /sys/power/state"], "/sys/power/state"),
+        # loginctl suspend
+        (["loginctl", "suspend"], "loginctl"),
+        # systemctl suspend
+        (["systemctl", "suspend"], "systemctl"),
+    ]
+
+    for cmd, name in methods:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            decky.logger.info(f"Suspend ({name}): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
+            if result.returncode == 0:
+                return {"status": "suspending", "method": name}
+        except FileNotFoundError:
+            decky.logger.info(f"Suspend ({name}): not found")
+            continue
+        except Exception as e:
+            decky.logger.error(f"Suspend ({name}): {e}")
+            continue
+
+    return {"status": "error", "message": "All suspend methods failed"}
+
+
+# ---------------------------------------------------------------------------
 # HDMI-CEC TV control (via cec-ctl)
 # ---------------------------------------------------------------------------
 def cec_standby() -> dict:
@@ -400,8 +434,9 @@ class Plugin:
 
         @self.http_server.route("POST", "/suspend")
         async def handle_suspend(_body):
-            asyncio.get_event_loop().call_later(3, lambda: os.system("systemctl suspend"))
-            return {"status": "suspending"}
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, do_suspend)
+            return result
 
         @self.http_server.route("POST", "/cec-standby")
         async def handle_cec_standby(_body):
