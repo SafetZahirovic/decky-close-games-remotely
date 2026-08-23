@@ -346,58 +346,69 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 # Suspend / Sleep
 # ---------------------------------------------------------------------------
 def do_suspend() -> dict:
-    """Put this device to sleep via D-Bus logind (same method as MoonDeck Buddy)."""
+    """Put this device to sleep. Tries multiple methods."""
     import subprocess
     errors = []
 
-    # Method 1: dbus-send to org.freedesktop.login1.Manager.Suspend(true)
+    # Method 0: Python dbus module (native, no subprocess)
     try:
-        result = subprocess.run([
-            "dbus-send", "--system", "--print-reply",
-            "--dest=org.freedesktop.login1",
-            "/org/freedesktop/login1",
-            "org.freedesktop.login1.Manager.Suspend",
-            "boolean:true",
-        ], capture_output=True, text=True, timeout=10)
-        decky.logger.info(f"Suspend (dbus-send): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
-        if result.returncode == 0:
-            return {"status": "suspending", "method": "dbus-send"}
-        errors.append(f"dbus-send: rc={result.returncode} {result.stderr.strip()}")
-    except FileNotFoundError:
-        errors.append("dbus-send: not found")
+        import dbus
+        bus = dbus.SystemBus()
+        logind = bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1")
+        manager = dbus.Interface(logind, "org.freedesktop.login1.Manager")
+        manager.Suspend(True)
+        decky.logger.info("Suspend (python-dbus): success")
+        return {"status": "suspending", "method": "python-dbus"}
+    except ImportError:
+        errors.append("python-dbus: module not available")
+        decky.logger.info("Suspend: python dbus module not available")
     except Exception as e:
-        errors.append(f"dbus-send: {e}")
+        errors.append(f"python-dbus: {e}")
+        decky.logger.error(f"Suspend (python-dbus): {e}")
 
-    # Method 2: busctl (alternative D-Bus client, common on systemd systems)
+    # Build list of commands to try with full paths
+    commands = [
+        ("dbus-send", ["/usr/bin/dbus-send", "--system", "--print-reply",
+                       "--dest=org.freedesktop.login1", "/org/freedesktop/login1",
+                       "org.freedesktop.login1.Manager.Suspend", "boolean:true"]),
+        ("busctl", ["/usr/bin/busctl", "call", "org.freedesktop.login1",
+                    "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                    "Suspend", "b", "true"]),
+        ("loginctl", ["/usr/bin/loginctl", "suspend"]),
+        ("systemctl", ["/usr/bin/systemctl", "suspend"]),
+    ]
+
+    for name, cmd in commands:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            out = result.stdout.strip()
+            err = result.stderr.strip()
+            decky.logger.info(f"Suspend ({name}): rc={result.returncode}, out={out}, err={err}")
+            if result.returncode == 0:
+                return {"status": "suspending", "method": name}
+            errors.append(f"{name}: rc={result.returncode} err={err}")
+        except FileNotFoundError:
+            errors.append(f"{name}: binary not found")
+            decky.logger.info(f"Suspend ({name}): not found")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            decky.logger.error(f"Suspend ({name}): {e}")
+
+    # Check for inhibitors that might block suspend
     try:
-        result = subprocess.run([
-            "busctl", "call", "org.freedesktop.login1",
-            "/org/freedesktop/login1",
-            "org.freedesktop.login1.Manager",
-            "Suspend", "b", "true",
-        ], capture_output=True, text=True, timeout=10)
-        decky.logger.info(f"Suspend (busctl): rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
-        if result.returncode == 0:
-            return {"status": "suspending", "method": "busctl"}
-        errors.append(f"busctl: rc={result.returncode} {result.stderr.strip()}")
-    except FileNotFoundError:
-        errors.append("busctl: not found")
-    except Exception as e:
-        errors.append(f"busctl: {e}")
+        result = subprocess.run(
+            ["/usr/bin/systemd-inhibit", "--list"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.stdout.strip():
+            decky.logger.info(f"Active inhibitors:\n{result.stdout.strip()}")
+            errors.append(f"inhibitors: {result.stdout.strip()[:200]}")
+    except Exception:
+        pass
 
-    # Method 3: systemctl suspend
-    try:
-        result = subprocess.run(["systemctl", "suspend"], capture_output=True, text=True, timeout=10)
-        decky.logger.info(f"Suspend (systemctl): rc={result.returncode}, err={result.stderr.strip()}")
-        if result.returncode == 0:
-            return {"status": "suspending", "method": "systemctl"}
-        errors.append(f"systemctl: rc={result.returncode} {result.stderr.strip()}")
-    except Exception as e:
-        errors.append(f"systemctl: {e}")
-
-    all_errors = "; ".join(errors)
+    all_errors = " | ".join(errors)
     decky.logger.error(f"All suspend methods failed: {all_errors}")
-    return {"status": "error", "message": f"All suspend methods failed: {all_errors}"}
+    return {"status": "error", "message": all_errors}
 
 
 # ---------------------------------------------------------------------------
