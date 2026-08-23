@@ -455,16 +455,24 @@ async def _ws_connect(tv_ip: str) -> tuple:
             writer.write(handshake.encode())
             await writer.drain()
 
-            response = await asyncio.wait_for(reader.read(4096), timeout=5)
-            if b"101" in response:
-                decky.logger.info(f"WebSocket connected to TV on port {port} ({'SSL' if use_ssl else 'plain'})")
-                return reader, writer, None
-            else:
-                resp_line = response.split(b"\r\n")[0].decode(errors="replace")
-                msg = f"Port {port} ({'SSL' if use_ssl else 'plain'}): handshake rejected ({resp_line})"
+            # Read HTTP response LINE BY LINE to avoid consuming WebSocket frame bytes
+            status_line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if b"101" not in status_line:
+                resp_text = status_line.decode(errors="replace").strip()
+                msg = f"Port {port} ({'SSL' if use_ssl else 'plain'}): handshake rejected ({resp_text})"
                 decky.logger.warning(msg)
                 errors.append(msg)
                 writer.close()
+                continue
+
+            # Read remaining headers until empty line
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=5)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+
+            decky.logger.info(f"WebSocket connected to TV on port {port} ({'SSL' if use_ssl else 'plain'})")
+            return reader, writer, None
         except Exception as e:
             msg = f"Port {port} ({'SSL' if use_ssl else 'plain'}): {e}"
             decky.logger.warning(f"TV connection failed — {msg}")
@@ -662,21 +670,38 @@ async def turn_off_lg_tv(tv_ip: str, client_key: str = "", tv_mac: str = "") -> 
         # Wait for registration response
         # First time: TV shows pairing prompt on screen, user must accept
         # Subsequent times: TV accepts stored client-key immediately
+        consecutive_errors = 0
         for _ in range(120):  # 2 minutes for user to accept on TV
             try:
                 msg = await ws_recv()
-            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                consecutive_errors = 0  # Reset on successful read
+            except asyncio.IncompleteReadError as e:
+                decky.logger.warning(f"TV connection lost: {e}")
+                writer.close()
+                return {"status": "error", "message": "TV closed the connection. Is the TV on and awake?"}
+            except asyncio.TimeoutError:
+                consecutive_errors += 1
+                if consecutive_errors >= 6:  # 60 seconds of silence
+                    decky.logger.warning("TV not responding for 60s")
+                    writer.close()
+                    return {"status": "error", "message": "TV not responding. Is the TV on and awake?"}
                 continue
+            except ConnectionResetError:
+                writer.close()
+                return {"status": "error", "message": "TV reset the connection."}
+
             if not msg:
-                continue
+                writer.close()
+                return {"status": "error", "message": "TV closed the WebSocket connection."}
+
             try:
                 data = json.loads(msg)
             except json.JSONDecodeError:
-                decky.logger.warning(f"TV sent non-JSON: {msg[:100]}")
+                decky.logger.warning(f"TV sent non-JSON: {msg[:200]}")
                 continue
 
             msg_type = data.get("type", "")
-            decky.logger.info(f"TV response: type={msg_type}")
+            decky.logger.info(f"TV response: type={msg_type}, data={json.dumps(data)[:300]}")
 
             if msg_type == "registered":
                 new_key = data.get("payload", {}).get("client-key", client_key)
