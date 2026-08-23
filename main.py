@@ -368,6 +368,28 @@ def cec_standby() -> dict:
     return {"status": "error", "message": "cec-ctl not found or CEC commands failed"}
 
 
+def cec_wakeup() -> dict:
+    """Turn on the TV via HDMI-CEC image-view-on command."""
+    import subprocess
+    clean_env = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root"}
+    for cmd in [
+        ["cec-ctl", "--image-view-on", "-t0"],
+        ["cec-ctl", "-d/dev/cec0", "--image-view-on", "-t0"],
+        ["cec-ctl", "--image-view-on"],
+    ]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=clean_env)
+            decky.logger.info(f"CEC wake {cmd}: rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
+            if result.returncode == 0:
+                return {"status": "ok", "method": "cec"}
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            decky.logger.error(f"CEC wake {cmd} failed: {e}")
+            continue
+    return {"status": "error", "message": "cec-ctl not found or CEC commands failed"}
+
+
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
@@ -410,6 +432,11 @@ class Plugin:
         async def handle_cec_standby(_body):
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, cec_standby)
+
+        @self.http_server.route("POST", "/cec-wakeup")
+        async def handle_cec_wakeup(_body):
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, cec_wakeup)
 
         await self.http_server.start()
         decky.logger.info("Close Games Remotely plugin loaded")
@@ -491,6 +518,11 @@ class Plugin:
     async def cec_tv_off_remote(self, ip: str) -> dict:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, http_post, f"http://{ip}:{PLUGIN_PORT}/cec-standby")
+        return result if result else {"status": "error", "message": "Could not reach device"}
+
+    async def cec_tv_on_remote(self, ip: str) -> dict:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, http_post, f"http://{ip}:{PLUGIN_PORT}/cec-wakeup")
         return result if result else {"status": "error", "message": "Could not reach device"}
 
     # ---- Local commands ---------------------------------------------------

@@ -16,7 +16,7 @@ import {
   DialogButton,
   ToggleField,
 } from "@decky/ui";
-import { FaPowerOff, FaPlus, FaTrash, FaDesktop, FaSyncAlt, FaMoon } from "react-icons/fa";
+import { FaPowerOff, FaPlus, FaTrash, FaDesktop, FaMoon, FaSun, FaTv, FaWifi } from "react-icons/fa";
 
 // Backend callables
 const getSettings = callable<[], Settings>("get_settings");
@@ -25,19 +25,20 @@ const removeDevice = callable<[ip: string], boolean>("remove_device");
 const pingDevice = callable<[ip: string], PingResult>("ping_device");
 const wakeDevice = callable<[mac: string, ip: string], StatusResult>("wake_device");
 const getRemoteStatus = callable<[ip: string], RemoteStatus>("get_remote_status");
-const closeRemoteGames = callable<[ip: string], CloseResult>("close_remote_games");
 const nukeDevice = callable<
   [ip: string, mac: string, shutdownAfter: boolean, turnOffTv: boolean],
   NukeResult
 >("nuke_device");
 const suspendRemote = callable<[ip: string], StatusResult>("suspend_remote");
+const cecTvOffRemote = callable<[ip: string], StatusResult>("cec_tv_off_remote");
+const cecTvOnRemote = callable<[ip: string], StatusResult>("cec_tv_on_remote");
 const getLocalGames = callable<[], GameInfo[]>("get_local_games");
 const closeLocalGames = callable<[], CloseResult>("close_local_games");
 
 // Types
 interface Device { name: string; ip: string; mac: string }
 interface Settings { devices: Device[]; plugin_port?: number }
-interface StatusResult { status: string; message?: string }
+interface StatusResult { status: string; message?: string; method?: string }
 interface PingResult { status: string; hostname?: string; mac?: string }
 interface AddDeviceResult { status: string; mac?: string; message?: string }
 interface GameInfo { pid: number; app_id: string; name: string; pids?: number[] }
@@ -147,6 +148,20 @@ function AddDeviceForm({ onAdd, onCancel }: { onAdd: () => void; onCancel: () =>
 }
 
 // ---------------------------------------------------------------------------
+// Helper button
+// ---------------------------------------------------------------------------
+function HelperButton({ icon, label, disabled, onClick }: {
+  icon: React.ReactNode; label: string; disabled?: boolean; onClick: () => void;
+}) {
+  return (
+    <ButtonItem layout="below" disabled={disabled} onClick={onClick}>
+      <span style={{ marginRight: "8px" }}>{icon}</span>
+      {label}
+    </ButtonItem>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Device card
 // ---------------------------------------------------------------------------
 function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void }) {
@@ -155,6 +170,7 @@ function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void
   const [busy, setBusy] = useState(false);
   const [steps, setSteps] = useState<Record<string, StepState> | null>(null);
   const [cecEnabled, setCecEnabled] = useState(true);
+  const [showHelpers, setShowHelpers] = useState(false);
 
   const refreshStatus = useCallback(async () => {
     const result = await pingDevice(device.ip);
@@ -195,45 +211,12 @@ function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void
     await nukeDevice(device.ip, device.mac, true, cecEnabled);
   };
 
-  const handleCloseOnly = async () => {
-    setBusy(true);
-    setSteps({
-      wake: { status: "pending", detail: "" },
-      boot: { status: "pending", detail: "" },
-      close: { status: "pending", detail: "" },
-    });
-
-    if (status === "offline") {
-      setSteps((prev) => prev && { ...prev, wake: { status: "active", detail: "Sending WOL..." } });
-      await wakeDevice(device.mac, device.ip);
-      setSteps((prev) => prev && { ...prev, wake: { status: "done", detail: "" }, boot: { status: "active", detail: "Waiting..." } });
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const ping = await pingDevice(device.ip);
-        if (ping.status === "ok") break;
-      }
-      setSteps((prev) => prev && { ...prev, boot: { status: "done", detail: "" } });
+  const toast = (title: string, result: StatusResult) => {
+    if (result.status === "ok" || result.status === "suspending") {
+      toaster.toast({ title, body: `${device.name}: OK` });
     } else {
-      setSteps((prev) => prev && {
-        ...prev,
-        wake: { status: "done", detail: "Already online" },
-        boot: { status: "done", detail: "" },
-      });
+      toaster.toast({ title: `${title} failed`, body: result.message || "Error" });
     }
-
-    setSteps((prev) => prev && { ...prev, close: { status: "active", detail: "Closing games..." } });
-    const result = await closeRemoteGames(device.ip);
-    if (result.status === "ok") {
-      const count = result.closed?.length || 0;
-      const names = result.closed?.map((g) => g.name).join(", ") || "";
-      setSteps((prev) => prev && { ...prev, close: { status: "done", detail: count > 0 ? `Closed ${names}` : "No games running" } });
-      toaster.toast({ title: "Games closed", body: `${count} game(s) on ${device.name}` });
-    } else {
-      setSteps((prev) => prev && { ...prev, close: { status: "error", detail: "Failed to close games" } });
-    }
-    setBusy(false);
-    refreshStatus();
-    setTimeout(() => setSteps(null), 5000);
   };
 
   const statusIcon = status === "online" ? "\uD83D\uDFE2" : status === "offline" ? "\uD83D\uDD34" : "\u26AA";
@@ -261,48 +244,72 @@ function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void
       )}
 
       <PanelSectionRow>
-        <ToggleField
-          label="Turn off TV (CEC)"
-          checked={cecEnabled}
-          onChange={setCecEnabled}
-        />
+        <ToggleField label="Turn off TV (CEC)" checked={cecEnabled} onChange={setCecEnabled} />
       </PanelSectionRow>
 
       <PanelSectionRow>
         <ButtonItem layout="below" disabled={busy} onClick={handleNuke}>
           <FaPowerOff style={{ marginRight: "8px" }} />
-          Nuke (Close + Sync{cecEnabled ? " + TV Off" : ""} + Sleep)
+          Nuke
         </ButtonItem>
       </PanelSectionRow>
 
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={busy} onClick={handleCloseOnly}>
-          <FaSyncAlt style={{ marginRight: "8px" }} />
-          Close Games Only
+        <ButtonItem layout="below" onClick={() => setShowHelpers(!showHelpers)}>
+          {showHelpers ? "Hide Helpers" : "Helpers"}
         </ButtonItem>
       </PanelSectionRow>
 
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          disabled={busy || status !== "online"}
-          onClick={async () => {
-            const result = await suspendRemote(device.ip);
-            const method = (result as any).method || "";
-            if (result.status === "suspending") {
-              toaster.toast({ title: "Sleep", body: `${device.name} sleeping (${method})` });
-              setTimeout(refreshStatus, 5000);
-            } else if (result.status === "error") {
-              toaster.toast({ title: "Sleep failed", body: result.message || "Failed" });
-            } else {
-              toaster.toast({ title: "Sleep", body: `${device.name}: ${JSON.stringify(result)}` });
-            }
-          }}
-        >
-          <FaMoon style={{ marginRight: "8px" }} />
-          Sleep
-        </ButtonItem>
-      </PanelSectionRow>
+      {showHelpers && (
+        <Fragment>
+          <PanelSectionRow>
+            <HelperButton
+              icon={<FaWifi />}
+              label="Wake (WOL)"
+              disabled={busy || !device.mac}
+              onClick={async () => {
+                const r = await wakeDevice(device.mac, device.ip);
+                toast("Wake", r);
+                setTimeout(refreshStatus, 5000);
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <HelperButton
+              icon={<FaMoon />}
+              label="Sleep"
+              disabled={busy || status !== "online"}
+              onClick={async () => {
+                const r = await suspendRemote(device.ip);
+                toast("Sleep", r);
+                setTimeout(refreshStatus, 5000);
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <HelperButton
+              icon={<FaSun />}
+              label="TV On (CEC)"
+              disabled={busy || status !== "online"}
+              onClick={async () => {
+                const r = await cecTvOnRemote(device.ip);
+                toast("TV On", r);
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <HelperButton
+              icon={<FaTv />}
+              label="TV Off (CEC)"
+              disabled={busy || status !== "online"}
+              onClick={async () => {
+                const r = await cecTvOffRemote(device.ip);
+                toast("TV Off", r);
+              }}
+            />
+          </PanelSectionRow>
+        </Fragment>
+      )}
 
       <PanelSectionRow>
         <Focusable style={{ display: "flex", gap: "8px" }}>
@@ -406,28 +413,15 @@ function MainPanel() {
 }
 
 export default definePlugin(() => {
-  // Listen for suspend event from backend — use Steam's own suspend API
   const suspendListener = addEventListener("do_suspend", () => {
     try {
       const sc = (window as any).SteamClient;
-      // Log available methods for debugging
-      if (sc?.System) {
-        console.log("SteamClient.System methods:", Object.keys(sc.System));
-      }
-
-      // Try various known Steam suspend APIs
       if (sc?.System?.SuspendPC) {
-        console.log("Using SteamClient.System.SuspendPC()");
         sc.System.SuspendPC();
       } else if (sc?.System?.ShutdownAsync) {
-        // ESystemShutdownType: 0=shutdown, 1=reboot, 2=suspend
-        console.log("Using SteamClient.System.ShutdownAsync(2)");
         sc.System.ShutdownAsync(2);
       } else if (sc?.User?.StartShutdown) {
-        console.log("Using SteamClient.User.StartShutdown(false)");
         sc.User.StartShutdown(false);
-      } else {
-        console.error("No Steam suspend API found. Available:", sc?.System ? Object.keys(sc.System) : "no System");
       }
     } catch (e) {
       console.error("Failed to suspend via Steam API:", e);
