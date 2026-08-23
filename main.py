@@ -451,11 +451,9 @@ class Plugin:
 
         @self.http_server.route("POST", "/suspend")
         async def handle_suspend(_body):
-            loop = asyncio.get_event_loop()
-            # Run do_suspend directly — if it works, the machine sleeps and
-            # the HTTP response may not arrive (client should handle timeout as success)
-            result = await loop.run_in_executor(None, do_suspend)
-            return result
+            # Emit event to frontend — frontend calls Steam's own suspend API
+            await decky.emit("do_suspend")
+            return {"status": "suspending", "method": "steam-api"}
 
         @self.http_server.route("POST", "/cec-standby")
         async def handle_cec_standby(_body):

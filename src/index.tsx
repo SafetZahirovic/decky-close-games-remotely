@@ -406,11 +406,30 @@ function MainPanel() {
 }
 
 export default definePlugin(() => {
+  // Listen for suspend event from backend — use Steam's own suspend API
+  const suspendListener = addEventListener("do_suspend", () => {
+    try {
+      // SteamClient is available globally in Steam's UI context
+      const sc = (window as any).SteamClient;
+      if (sc?.System?.Suspend) {
+        sc.System.Suspend();
+      } else if (sc?.User?.StartShutdown) {
+        sc.User.StartShutdown(false); // false = suspend
+      } else {
+        console.error("No Steam suspend API found");
+      }
+    } catch (e) {
+      console.error("Failed to suspend via Steam API:", e);
+    }
+  });
+
   return {
     name: "Close Games Remotely",
     titleView: <div className={staticClasses.Title}>Close Games Remotely</div>,
     content: <MainPanel />,
     icon: <FaDesktop />,
-    onDismount() {},
+    onDismount() {
+      removeEventListener("do_suspend", suspendListener);
+    },
   };
 });
