@@ -411,6 +411,34 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 
 
 # ---------------------------------------------------------------------------
+# HDMI-CEC TV control (via cec-ctl)
+# ---------------------------------------------------------------------------
+def cec_standby() -> dict:
+    """Turn off the TV via HDMI-CEC standby command."""
+    import subprocess
+    # Try cec-ctl (v4l-utils, common on SteamOS)
+    for cmd in [
+        ["cec-ctl", "--standby", "-t0"],              # standby to TV (addr 0)
+        ["cec-ctl", "-d/dev/cec0", "--standby", "-t0"],  # explicit device
+        ["cec-ctl", "--standby"],                      # broadcast standby
+    ]:
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10
+            )
+            decky.logger.info(f"CEC command {cmd}: rc={result.returncode}, out={result.stdout.strip()}, err={result.stderr.strip()}")
+            if result.returncode == 0:
+                return {"status": "ok", "method": "cec", "command": " ".join(cmd)}
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            decky.logger.error(f"CEC command {cmd} failed: {e}")
+            continue
+
+    return {"status": "error", "message": "cec-ctl not found or all CEC commands failed. Is the TV connected via HDMI?"}
+
+
+# ---------------------------------------------------------------------------
 # LG WebOS TV control (minimal WebSocket implementation)
 # ---------------------------------------------------------------------------
 import hashlib
@@ -788,6 +816,12 @@ class Plugin:
             asyncio.get_event_loop().call_later(3, lambda: os.system("systemctl suspend"))
             return {"status": "suspending"}
 
+        @self.http_server.route("POST", "/cec-standby")
+        async def handle_cec_standby(_body):
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, cec_standby)
+            return result
+
         await self.http_server.start()
         decky.logger.info("Close Games Remotely plugin loaded")
 
@@ -922,17 +956,49 @@ class Plugin:
     async def close_local_games(self) -> dict:
         return await close_all_games()
 
-    # ---- LG TV ------------------------------------------------------------
+    # ---- TV control -------------------------------------------------------
+
+    async def cec_tv_off_remote(self, ip: str) -> dict:
+        """Tell a remote device to turn off its TV via HDMI-CEC."""
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, http_post, f"http://{ip}:{PLUGIN_PORT}/cec-standby"
+        )
+        if result:
+            return result
+        return {"status": "error", "message": "Could not reach device for CEC command"}
+
+    async def cec_tv_off_local(self) -> dict:
+        """Turn off TV via HDMI-CEC on this device."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, cec_standby)
 
     async def tv_off(self) -> dict:
-        """Turn off the configured LG TV."""
+        """Turn off the TV. Tries CEC first (via remote device), falls back to WebOS."""
+        # Try CEC via any configured remote device that's online
+        for device in self.settings.get("devices", []):
+            loop = asyncio.get_event_loop()
+            ping = await loop.run_in_executor(
+                None, http_get, f"http://{device['ip']}:{PLUGIN_PORT}/ping"
+            )
+            if ping and ping.get("status") == "ok":
+                result = await self.cec_tv_off_remote(device["ip"])
+                if result.get("status") == "ok":
+                    return result
+                decky.logger.warning(f"CEC failed on {device['ip']}: {result.get('message')}")
+
+        # Also try CEC locally (in case this device is connected to the TV)
+        local_result = await self.cec_tv_off_local()
+        if local_result.get("status") == "ok":
+            return local_result
+
+        # Fall back to WebOS
         tv_ip = self.settings.get("tv_ip", "")
         if not tv_ip:
-            return {"status": "error", "message": "No TV IP configured"}
+            return {"status": "error", "message": "CEC failed and no TV IP configured for WebOS fallback"}
         client_key = self.settings.get("tv_client_key", "")
         tv_mac = self.settings.get("tv_mac", "")
         result = await turn_off_lg_tv(tv_ip, client_key, tv_mac=tv_mac)
-        # Save the client key for future use (skip pairing next time)
         if result.get("client_key") and result["client_key"] != client_key:
             self.settings["tv_client_key"] = result["client_key"]
             save_settings(self.settings)
@@ -1031,12 +1097,20 @@ class Plugin:
 
             # Step 5: Turn off TV (if configured)
             if turn_off_tv:
-                await step("tv", "active", "Turning off TV...")
-                tv_result = await self.tv_off()
+                await step("tv", "active", "Turning off TV via CEC...")
+                # Try CEC on the remote device first (it's connected to the TV via HDMI)
+                tv_result = await self.cec_tv_off_remote(ip)
                 if tv_result.get("status") == "ok":
-                    await step("tv", "done", "TV is off")
+                    method = tv_result.get("method", "cec")
+                    await step("tv", "done", f"TV off ({method})")
                 else:
-                    await step("tv", "error", tv_result.get("message", "Failed"))
+                    # Fall back to WebOS if CEC fails
+                    await step("tv", "active", "CEC failed, trying WebOS...")
+                    tv_result = await self.tv_off()
+                    if tv_result.get("status") == "ok":
+                        await step("tv", "done", "TV off (WebOS)")
+                    else:
+                        await step("tv", "error", tv_result.get("message", "Failed"))
 
             # Step 6: Put device back to sleep
             if shutdown_after:
