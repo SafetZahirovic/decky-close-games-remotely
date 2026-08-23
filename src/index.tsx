@@ -409,14 +409,25 @@ export default definePlugin(() => {
   // Listen for suspend event from backend — use Steam's own suspend API
   const suspendListener = addEventListener("do_suspend", () => {
     try {
-      // SteamClient is available globally in Steam's UI context
       const sc = (window as any).SteamClient;
-      if (sc?.System?.Suspend) {
-        sc.System.Suspend();
+      // Log available methods for debugging
+      if (sc?.System) {
+        console.log("SteamClient.System methods:", Object.keys(sc.System));
+      }
+
+      // Try various known Steam suspend APIs
+      if (sc?.System?.SuspendPC) {
+        console.log("Using SteamClient.System.SuspendPC()");
+        sc.System.SuspendPC();
+      } else if (sc?.System?.ShutdownAsync) {
+        // ESystemShutdownType: 0=shutdown, 1=reboot, 2=suspend
+        console.log("Using SteamClient.System.ShutdownAsync(2)");
+        sc.System.ShutdownAsync(2);
       } else if (sc?.User?.StartShutdown) {
-        sc.User.StartShutdown(false); // false = suspend
+        console.log("Using SteamClient.User.StartShutdown(false)");
+        sc.User.StartShutdown(false);
       } else {
-        console.error("No Steam suspend API found");
+        console.error("No Steam suspend API found. Available:", sc?.System ? Object.keys(sc.System) : "no System");
       }
     } catch (e) {
       console.error("Failed to suspend via Steam API:", e);
