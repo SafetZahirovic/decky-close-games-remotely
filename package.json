@@ -1,6 +1,6 @@
 {
   "name": "decky-close-games-remotely",
-  "version": "0.7.1",
+  "version": "1.0.0",
   "type": "module",
   "description": "Remotely close games on other Steam devices for Steam Cloud sync",
   "scripts": {

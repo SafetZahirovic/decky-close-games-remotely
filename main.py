@@ -342,55 +342,6 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
         return None
 
 
-# ---------------------------------------------------------------------------
-# Suspend / Sleep
-# ---------------------------------------------------------------------------
-def do_suspend() -> dict:
-    """Put this device to sleep. Uses --force to override Steam's suspend inhibitor."""
-    import subprocess
-
-    # Log what suspend states the kernel supports and active inhibitors
-    try:
-        with open("/sys/power/state", "r") as f:
-            states = f.read().strip()
-        decky.logger.info(f"Available suspend states: {states}")
-    except Exception as e:
-        decky.logger.warning(f"Cannot read /sys/power/state: {e}")
-
-    try:
-        result = subprocess.run(["systemd-inhibit", "--list"], capture_output=True, text=True, timeout=5)
-        decky.logger.info(f"Active inhibitors:\n{result.stdout.strip()}")
-    except Exception:
-        pass
-
-    decky.logger.info(f"Running as uid={os.getuid()} euid={os.geteuid()}")
-
-    # Clean environment — Decky's PyInstaller bundles LD_LIBRARY_PATH pointing
-    # to /tmp/_MEI... which breaks system binaries like systemctl
-    clean_env = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root"}
-
-    commands = [
-        ("systemctl-force", ["systemctl", "suspend", "--force", "--no-ask-password"]),
-        ("loginctl", ["loginctl", "suspend"]),
-        ("kernel", ["sh", "-c", "echo mem > /sys/power/state"]),
-        ("systemctl", ["systemctl", "suspend"]),
-    ]
-
-    errors = []
-    for name, cmd in commands:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, env=clean_env)
-            decky.logger.info(f"Suspend ({name}): rc={result.returncode} out=[{result.stdout.strip()}] err=[{result.stderr.strip()}]")
-            if result.returncode == 0:
-                return {"status": "suspending", "method": name}
-            errors.append(f"{name}:rc{result.returncode}:{result.stderr.strip()[:80]}")
-        except subprocess.TimeoutExpired:
-            return {"status": "suspending", "method": f"{name}(timeout=ok)"}
-        except Exception as e:
-            errors.append(f"{name}:{e}")
-
-    return {"status": "error", "message": " | ".join(errors)}
-
 
 # ---------------------------------------------------------------------------
 # HDMI-CEC TV control (via cec-ctl)
