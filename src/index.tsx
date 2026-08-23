@@ -16,7 +16,7 @@ import {
   DialogButton,
   ToggleField,
 } from "@decky/ui";
-import { FaPowerOff, FaPlus, FaTrash, FaDesktop, FaSyncAlt } from "react-icons/fa";
+import { FaPowerOff, FaPlus, FaTrash, FaDesktop, FaSyncAlt, FaMoon } from "react-icons/fa";
 
 // Backend callables
 const getSettings = callable<[], Settings>("get_settings");
@@ -30,6 +30,7 @@ const nukeDevice = callable<
   [ip: string, mac: string, shutdownAfter: boolean, turnOffTv: boolean],
   NukeResult
 >("nuke_device");
+const suspendRemote = callable<[ip: string], StatusResult>("suspend_remote");
 const getLocalGames = callable<[], GameInfo[]>("get_local_games");
 const closeLocalGames = callable<[], CloseResult>("close_local_games");
 
@@ -278,6 +279,25 @@ function DeviceCard({ device, onRemove }: { device: Device; onRemove: () => void
         <ButtonItem layout="below" disabled={busy} onClick={handleCloseOnly}>
           <FaSyncAlt style={{ marginRight: "8px" }} />
           Close Games Only
+        </ButtonItem>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={busy || status !== "online"}
+          onClick={async () => {
+            const result = await suspendRemote(device.ip);
+            if (result.status === "suspending") {
+              toaster.toast({ title: "Sleep", body: `${device.name} is going to sleep` });
+              setTimeout(refreshStatus, 5000);
+            } else {
+              toaster.toast({ title: "Sleep failed", body: result.message || "Error" });
+            }
+          }}
+        >
+          <FaMoon style={{ marginRight: "8px" }} />
+          Sleep
         </ButtonItem>
       </PanelSectionRow>
 
