@@ -346,57 +346,36 @@ def http_post(url: str, data: dict | None = None, timeout: int = 60) -> dict | N
 # Suspend / Sleep
 # ---------------------------------------------------------------------------
 def do_suspend() -> dict:
-    """Put this device to sleep. Tries multiple methods via shell."""
+    """Put this device to sleep. We run as root so we can write directly to /sys/power/state."""
     import subprocess
 
-    # Use sh -c for all commands so the shell resolves PATH
-    commands = [
-        ("dbus-send", "dbus-send --system --print-reply --dest=org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager.Suspend boolean:true"),
-        ("busctl", "busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager Suspend b true"),
-        ("loginctl", "loginctl suspend"),
-        ("systemctl", "systemctl suspend"),
-    ]
+    # Method 1: Direct kernel suspend (most reliable as root, bypasses D-Bus/polkit entirely)
+    try:
+        with open("/sys/power/state", "w") as f:
+            f.write("mem\n")
+        # If we get here, the machine woke back up from sleep
+        decky.logger.info("Suspend (/sys/power/state): success (resumed)")
+        return {"status": "suspending", "method": "/sys/power/state"}
+    except Exception as e:
+        decky.logger.error(f"Suspend (/sys/power/state): {e}")
+        err1 = str(e)
 
-    errors = []
-    for name, cmd in commands:
-        try:
-            result = subprocess.run(
-                ["sh", "-c", cmd],
-                capture_output=True, text=True, timeout=15,
-                env={"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/root", "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/run/dbus/system_bus_socket"},
-            )
-            out = result.stdout.strip()
-            err = result.stderr.strip()
-            decky.logger.info(f"Suspend ({name}): rc={result.returncode} out=[{out}] err=[{err}]")
-            if result.returncode == 0:
-                return {"status": "suspending", "method": name}
-            errors.append(f"{name}:rc{result.returncode}:{err or out or 'no output'}")
-        except subprocess.TimeoutExpired:
-            # Timeout likely means suspend worked (machine went to sleep mid-command)
-            decky.logger.info(f"Suspend ({name}): timed out (likely suspended)")
-            return {"status": "suspending", "method": f"{name} (timeout=success)"}
-        except Exception as e:
-            errors.append(f"{name}:{e}")
-            decky.logger.error(f"Suspend ({name}): {e}")
-
-    # Diagnostic: what's available on this system
-    diag = ""
+    # Method 2: systemctl suspend
     try:
         result = subprocess.run(
-            ["sh", "-c", "which dbus-send busctl loginctl systemctl 2>&1; echo '---'; cat /proc/version 2>&1"],
-            capture_output=True, text=True, timeout=5,
+            ["systemctl", "suspend"],
+            capture_output=True, text=True, timeout=15,
             env={"PATH": "/usr/bin:/usr/sbin:/bin:/sbin"},
         )
-        diag = result.stdout.strip()
-        decky.logger.info(f"Suspend diagnostics:\n{diag}")
-    except Exception:
-        pass
+        decky.logger.info(f"Suspend (systemctl): rc={result.returncode} err=[{result.stderr.strip()}]")
+        if result.returncode == 0:
+            return {"status": "suspending", "method": "systemctl"}
+    except subprocess.TimeoutExpired:
+        return {"status": "suspending", "method": "systemctl (timeout=success)"}
+    except Exception as e:
+        decky.logger.error(f"Suspend (systemctl): {e}")
 
-    all_errors = " | ".join(errors)
-    if diag:
-        all_errors += f" | diag:[{diag[:150]}]"
-    decky.logger.error(f"All suspend methods failed: {all_errors}")
-    return {"status": "error", "message": all_errors}
+    return {"status": "error", "message": f"/sys/power/state: {err1}"}
 
 
 # ---------------------------------------------------------------------------
